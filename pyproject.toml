@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kinisi-virtual-board"
+version = "0.1.0"
+description = "Kinisi SDK test board with native C firmware and Python hardware simulation"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.optional-dependencies]
+serial = ["pyserial>=3.5,<4"]
+
+[project.scripts]
+kinisi-virtual-board = "kinisi_virtual_board.__main__:main"
+
+[tool.setuptools.packages.find]
+include = ["kinisi_virtual_board*"]
+
+[tool.setuptools.package-data]
+kinisi_virtual_board = ["firmware_support/*.c", "firmware_support/*.h"]

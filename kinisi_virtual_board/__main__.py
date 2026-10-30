@@ -1,0 +1,75 @@
+"""Run a virtual board on native COM/TTY, Linux PTY, or TCP."""
+import argparse
+import json
+from pathlib import Path
+
+from . import Schema, TCPServer, VirtualBoard, FirmwareBoard
+from .native import PTYEndpoint, SerialEndpoint, serve_native
+
+
+def main():
+    sibling = Path(__file__).resolve().parents[2] / "kinisi-motor-controller-firmware"
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--backend", choices=["firmware", "python"], default="firmware", help="Native production C firmware (default) or Python behavioral model")
+    parser.add_argument("--firmware", type=Path, default=sibling, help="Firmware source checkout for the native backend")
+    parser.add_argument("--compiler", help="Host GCC/Clang executable; defaults to CC or auto-detection")
+    parser.add_argument("--commands", type=Path, help="Shared commands.json; defaults to --firmware/commands.json")
+    parser.add_argument("--board-profile", type=Path, help="Optional firmware boards/v0.x.json")
+    parser.add_argument("--revision", default="0.4.0", choices=["0.3.0", "0.4.0"])
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--port", type=int, default=8766, help="0 chooses an available port")
+    transport = parser.add_mutually_exclusive_group()
+    transport.add_argument("--serial", metavar="DEVICE", help="Emulator end of an existing virtual COM/TTY pair (no proxy)")
+    transport.add_argument("--pty", action="store_true", help="Create a Linux/POSIX virtual serial device for the SDK (no driver install)")
+    parser.add_argument("--baudrate", type=int, default=115200, help="Native serial baud rate (default: 115200)")
+    parser.add_argument("--check", action="store_true", help="Print schema identity/handler coverage and exit; fail on unsupported commands")
+    args = parser.parse_args()
+    try:
+        schema = Schema(args.commands or args.firmware / "commands.json")
+        if args.backend == "firmware" and args.board_profile:
+            raise ValueError("The firmware backend uses --firmware/boards and --revision; --board-profile is only for the Python model")
+        def factory():
+            if args.backend == "firmware":
+                return FirmwareBoard(schema, firmware=args.firmware, revision=args.revision, compiler=args.compiler)
+            return VirtualBoard(schema, args.board_profile, revision=args.revision)
+        board = factory()
+    except (OSError, ValueError, KeyError, RuntimeError) as error:
+        parser.error(str(error))
+    report = {"backend": args.backend, "protocol": ".".join(map(str, schema.version)), "commands": str(schema.path),
+              "sha256": schema.sha256, "board_revision": ".".join(map(str, board.revision)),
+              "unsupported_commands": board.unsupported_commands}
+    if args.backend == "firmware":
+        report["native_build"] = board.build
+    if args.check:
+        print(json.dumps(report, indent=2))
+        if hasattr(board, "close"):
+            board.close()
+        return int(bool(board.unsupported_commands))
+    if args.serial or args.pty:
+        try:
+            endpoint = SerialEndpoint(args.serial, args.baudrate) if args.serial else PTYEndpoint()
+            with endpoint:
+                print(json.dumps(dict(report, transport="serial" if args.serial else "pty",
+                                      serial_port=endpoint.port, baudrate=args.baudrate)), flush=True)
+                serve_native(board, endpoint)
+        except KeyboardInterrupt:
+            pass
+        except (OSError, ValueError, RuntimeError) as error:
+            parser.exit(1, f"Native serial error: {error}\n")
+        finally:
+            if hasattr(board, "close"):
+                board.close()
+        return 0
+    if hasattr(board, "close"):
+        board.close()
+    with TCPServer((args.host, args.port), factory) as server:
+        print(json.dumps(dict(report, listening=f"{server.server_address[0]}:{server.server_address[1]}")), flush=True)
+        try:
+            server.serve_forever(poll_interval=0.1)
+        except KeyboardInterrupt:
+            pass
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

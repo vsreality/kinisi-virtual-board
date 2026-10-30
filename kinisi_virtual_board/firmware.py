@@ -1,0 +1,213 @@
+"""Real C firmware with a Python motor plant and deterministic virtual time."""
+import ctypes as ct
+import math
+import os
+from pathlib import Path
+import shutil
+import tempfile
+import threading
+import weakref
+
+from .firmware_build import DEFAULT_FIRMWARE, build_firmware
+from .schema import Schema
+
+
+def _release(library, folder, dll_directory):
+    # No native worker threads exist. Calls are serialized and close is terminal.
+    import _ctypes
+    if os.name == "nt":
+        _ctypes.FreeLibrary(library._handle)
+    else:
+        _ctypes.dlclose(library._handle)
+    folder.cleanup()
+    if dll_directory:
+        dll_directory.close()
+
+
+class FirmwareBoard:
+    """Native firmware backend compatible with all virtual-board transports.
+
+    Motor output is PWM percent. A first-order plant returns quantized, wrapping
+    16-bit encoder counts to the production controller/odometry tasks. This runs
+    the firmware's C application, not the STM32 binary, HAL or real RTOS.
+    Instances own independent shared libraries and must be closed after use.
+    """
+    def __init__(self, commands=None, *, firmware=DEFAULT_FIRMWARE, revision="0.4.0",
+                 compiler=None, max_speed=10.0, time_constant=0.05, encoder_motors=(0, 1, 2, 3)):
+        self.schema = commands if isinstance(commands, Schema) else Schema(commands or Path(firmware) / "commands.json")
+        if not math.isfinite(max_speed) or max_speed <= 0 or not math.isfinite(time_constant) or time_constant <= 0:
+            raise ValueError("Plant max_speed and time_constant must be finite and positive")
+        if len(encoder_motors) != 4 or any(type(i) is not int or not 0 <= i < 4 for i in encoder_motors):
+            raise ValueError("encoder_motors must map each of the four encoders to a motor index")
+        self.revision = tuple(map(int, revision.split(".")))
+        self.max_speed, self.time_constant = max_speed, time_constant
+        self.encoder_motors = tuple(encoder_motors)
+        self.motor_velocity = [0.] * 4
+        self.motor_angle = [0.] * 4
+        self._counts = [0.] * 4
+        self.now_us = 0
+        self._fraction_us = 0.
+        self._lock = threading.RLock()
+        library, self.build = build_firmware(self.schema, firmware, revision, compiler)
+        self.unsupported_commands = self.build["unsupported_commands"]
+        folder = tempfile.TemporaryDirectory(prefix="kinisi-board-")
+        dll_directory = None
+        try:
+            instance = Path(folder.name) / library.name
+            shutil.copyfile(library, instance)
+            if os.name == "nt":
+                dll_directory = os.add_dll_directory(str(Path(self.build["compiler_path"]).parent))
+            self._lib = ct.CDLL(str(instance))
+        except BaseException:
+            folder.cleanup()
+            if dll_directory:
+                dll_directory.close()
+            raise
+        self._finalizer = weakref.finalize(self, _release, self._lib, folder, dll_directory)
+        signatures = {
+            "init": (None, ()), "feed": (ct.c_int, (ct.c_void_p, ct.c_size_t)),
+            "poll": (ct.c_int, (ct.c_uint64,)), "deadline": (ct.c_uint64, ()),
+            "read": (ct.c_size_t, (ct.c_void_p, ct.c_size_t)),
+            "disconnect": (None, ()), "lost": (ct.c_int, ()), "ready": (ct.c_int, ()),
+            "drop": (None, (ct.c_uint8, ct.c_uint)), "encoder": (None, (ct.c_uint8, ct.c_uint16)),
+            "pwm": (ct.c_double, (ct.c_uint8,)), "resolution": (ct.c_double, (ct.c_uint8,)),
+            "reverse": (ct.c_int, (ct.c_uint8,)), "mode": (ct.c_int, (ct.c_uint8,)),
+            "temperature": (None, (ct.c_double, ct.c_int)),
+            "imu": (None, (ct.POINTER(ct.c_double), ct.c_int)),
+            "current": (None, (ct.c_uint8, ct.c_double, ct.c_int)),
+            "fault": (None, (ct.c_uint8, ct.c_int)),
+        }
+        for name, (result, arguments) in signatures.items():
+            function = getattr(self._lib, "sim_" + name)
+            function.restype, function.argtypes = result, arguments
+        self._lib.sim_init()
+
+    def _check_open(self):
+        if not self._finalizer.alive:
+            raise RuntimeError("Native board is closed")
+
+    def _poll(self):
+        error = self._lib.sim_poll(self.now_us)
+        if error:
+            raise RuntimeError(f"Native scheduler invariant failed: {error}")
+
+    @property
+    def ready(self):
+        with self._lock:
+            self._check_open()
+            return bool(self._lib.sim_ready())
+
+    @property
+    def lost(self):
+        with self._lock:
+            self._check_open()
+            return bool(self._lib.sim_lost())
+
+    @property
+    def motor_pwm(self):
+        with self._lock:
+            self._check_open()
+            return tuple(self._lib.sim_pwm(i) for i in range(4))
+
+    def feed(self, data):
+        data = bytes(data)
+        with self._lock:
+            self._check_open()
+            if not self._lib.sim_feed(data, len(data)):
+                raise BufferError("Native firmware RX buffer full")
+            self._poll()
+
+    def drain(self, size=None):
+        size = 65536 if size is None else min(max(int(size), 0), 65536)
+        with self._lock:
+            self._check_open()
+            buffer = ct.create_string_buffer(size)
+            length = self._lib.sim_read(buffer, size)
+            return buffer.raw[:length]
+
+    def advance(self, seconds):
+        if not math.isfinite(seconds) or seconds < 0:
+            raise ValueError("Time advance must be finite and nonnegative")
+        with self._lock:
+            self._check_open()
+            elapsed = seconds * 1e6 + self._fraction_us
+            whole = int(elapsed)
+            self._fraction_us = elapsed - whole
+            end = self.now_us + whole
+            while self.now_us < end:
+                step = min(1000, end - self.now_us, self._lib.sim_deadline() - self.now_us)
+                if step <= 0:
+                    raise RuntimeError("Native scheduler failed to advance its deadline")
+                dt = step / 1e6
+                delta = []
+                for i in range(4):
+                    target = self._lib.sim_pwm(i) * self.max_speed / 100
+                    if self._lib.sim_reverse(i):
+                        target = -target
+                    # Braking decelerates faster than coasting; this is a test plant.
+                    tau = self.time_constant / (5 if self._lib.sim_mode(i) == 1 else 1)
+                    decay = math.exp(-dt / tau)
+                    prior = self.motor_velocity[i]
+                    self.motor_velocity[i] = target + (prior - target) * decay
+                    distance = target * dt + (prior - target) * tau * (1 - decay)
+                    self.motor_angle[i] += distance
+                    delta.append(distance)
+                for encoder, motor in enumerate(self.encoder_motors):
+                    self._counts[encoder] += delta[motor] * self._lib.sim_resolution(encoder) / math.tau
+                    self._lib.sim_encoder(encoder, int(self._counts[encoder]) & 0xffff)
+                self.now_us += step
+                self._poll()
+            self._poll()
+
+    def drop_next_reply(self, command, count=1):
+        if type(count) is not int or not 0 <= count <= 0xffffffff:
+            raise ValueError("Drop count must be an unsigned 32-bit integer")
+        with self._lock:
+            self._check_open()
+            self._lib.sim_drop(self.schema.code(command), count)
+
+    def set_temperature(self, celsius=25., *, status=0):
+        with self._lock:
+            self._check_open()
+            self._lib.sim_temperature(celsius, status)
+
+    def set_imu(self, acceleration=(0., 0., 9.80665), angular_velocity=(0., 0., 0.), *, status=0):
+        if len(acceleration) != 3 or len(angular_velocity) != 3:
+            raise ValueError("IMU vectors must have three components")
+        with self._lock:
+            self._check_open()
+            self._lib.sim_imu((ct.c_double * 6)(*acceleration, *angular_velocity), status)
+
+    def set_current(self, index, amperes=0., *, status=0):
+        self._index(index)
+        with self._lock:
+            self._check_open()
+            self._lib.sim_current(index, amperes, status)
+
+    @staticmethod
+    def _index(index):
+        if type(index) is not int or not 0 <= index < 4:
+            raise ValueError("Hardware index must be 0..3")
+
+    def set_fault(self, index, active=True):
+        self._index(index)
+        with self._lock:
+            self._check_open()
+            self._lib.sim_fault(index, active)
+
+    def disconnect(self):
+        with self._lock:
+            self._check_open()
+            self._lib.sim_disconnect()
+
+    def close(self):
+        with self._lock:
+            if self._finalizer.alive:
+                self._lib.sim_disconnect()
+                self._finalizer()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        self.close()

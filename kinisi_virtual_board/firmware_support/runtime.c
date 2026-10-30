@@ -1,0 +1,275 @@
+/* Native boundary only. All protocol, command and control algorithms link from
+ * the selected firmware checkout. One loaded library instance owns one board. */
+#include "connection.h"
+#include "commands_handler.h"
+#include "controllers_manager.h"
+#include "odometry_manager.h"
+#include "platform.h"
+#include "hw_config.h"
+#include "hw_clock.h"
+#include "hw_gpio.h"
+#include "hw_temperature.h"
+#include "hw_imu.h"
+#include "hw_current_sense.h"
+#include "hw_motor_faults.h"
+#include "hw_motor_current_limit.h"
+#include "hw_drv8873.h"
+#include "cmsis_os.h"
+#include "semphr.h"
+#include <math.h>
+#include <setjmp.h>
+#include <string.h>
+
+_Static_assert(sizeof(double) == 8, "Kinisi wire format requires 64-bit doubles");
+
+#ifdef _WIN32
+#define API __declspec(dllexport)
+#else
+#define API __attribute__((visibility("default")))
+#endif
+
+static uint64_t now_us;
+static connection_t session;
+static uint8_t rx[65536], tx[65536];
+static size_t rx_size, tx_size;
+static unsigned dropped[256];
+static int runtime_error;
+static double pwm[4], resolutions[4], temperature = 25., currents[4];
+static uint16_t counts[4];
+static uint8_t motor_ready[4], motor_reverse[4], motor_mode[4];
+static uint8_t encoder_ready[4], encoder_reverse[4], pins[10], led;
+static hw_imu_sample_t imu = {.acceleration_z = 9.80665};
+static hw_motor_faults_t faults[4];
+static uint32_t fault_sequence[4];
+static hw_motor_current_limit_t limits[4];
+static int temperature_status, imu_status, current_status[4];
+
+typedef struct { void (*fn)(void *); void *arg; uint64_t due; int primed; } task_t;
+static task_t tasks[4], *active_task;
+static unsigned task_count, delay_count, mutex_count;
+static uint8_t mutexes[8];
+static jmp_buf yield_task;
+
+/* These two production tasks have a delay at the top of their loop and no
+ * persistent automatic state beyond their argument/wake tick. Reenter them and
+ * yield at the next loop boundary, exactly as the existing firmware host tests.
+ * This is deterministic cooperative stepping, not a port of FreeRTOS. */
+osThreadId_t osThreadNew(void (*fn)(void *), void *arg, const osThreadAttr_t *attr) {
+    (void)attr;
+    if (task_count == 4) { runtime_error = 1; return NULL; }
+    task_t *task = &tasks[task_count++];
+    *task = (task_t){.fn = fn, .arg = arg, .due = now_us};
+    return task;
+}
+osThreadState_t osThreadGetState(osThreadId_t task) { return task ? 0 : osThreadError; }
+TickType_t xTaskGetTickCount(void) { return (TickType_t)(now_us / 1000); }
+void vTaskDelayUntil(TickType_t *last, TickType_t period) {
+    (void)last;
+    if (!active_task || !period) { runtime_error = 2; longjmp(yield_task, 1); }
+    if (!active_task->primed || delay_count++) {
+        active_task->primed = 1;
+        active_task->due = now_us + (uint64_t)period * 1000;
+        longjmp(yield_task, 1);
+    }
+}
+SemaphoreHandle_t xSemaphoreCreateMutex(void) {
+    if (mutex_count == sizeof(mutexes)) { runtime_error = 3; return NULL; }
+    return &mutexes[mutex_count++];
+}
+int xSemaphoreTake(SemaphoreHandle_t handle, uint32_t timeout) {
+    (void)timeout;
+    if (!handle || *(uint8_t *)handle) { runtime_error = 4; return 0; }
+    *(uint8_t *)handle = 1;
+    return 1;
+}
+void xSemaphoreGive(SemaphoreHandle_t handle) {
+    if (!handle || !*(uint8_t *)handle) { runtime_error = 5; return; }
+    *(uint8_t *)handle = 0;
+}
+uint64_t hw_clock_microseconds(void) { return now_us; }
+
+static void motor_stop(motorIndex i) { pwm[i] = 0; motor_mode[i] = 0; }
+static uint32_t pwm_frequency = SIM_PWM_DEFAULT;
+uint32_t hw_motor_get_pwm_frequency(void) { return pwm_frequency; }
+bool hw_motor_pwm_frequency_allowed(uint32_t value) {
+    for (unsigned i = 0; i < sizeof(sim_pwm_frequencies) / sizeof(sim_pwm_frequencies[0]); ++i)
+        if (value == sim_pwm_frequencies[i]) return true;
+    return false;
+}
+bool hw_motor_set_pwm_frequency(uint32_t value) {
+    if (!hw_motor_pwm_frequency_allowed(value)) return false;
+    for (unsigned i = 0; i < 4; ++i) motor_stop(i);
+    pwm_frequency = value;
+    return true;
+}
+static void motor_brake(motorIndex i) { pwm[i] = 0; motor_mode[i] = 1; }
+static void motor_init(motorIndex i, bool reverse) {
+    motor_stop(i); motor_ready[i] = !(SIM_HAS_DRIVER && faults[i].fault_active); motor_reverse[i] = reverse;
+    limits[i] = (hw_motor_current_limit_t){sim_limit_enabled[i], sim_limit_default[i]};
+}
+static uint8_t motor_initialized(motorIndex i) { return i < 4 && motor_ready[i]; }
+static uint8_t motor_reversed(motorIndex i) { return motor_reverse[i]; }
+static void motor_speed(motorIndex i, double value) {
+    if (!motor_ready[i] || faults[i].fault_active) { motor_stop(i); return; }
+    pwm[i] = fmax(-100., fmin(100., value)); motor_mode[i] = 2;
+}
+const hw_motor_interface_t *get_motor_interface(void) {
+    static const hw_motor_interface_t value = {motor_init, motor_reversed, motor_initialized, motor_speed, motor_stop, motor_brake};
+    return &value;
+}
+static void encoder_init(encoder_index_t i, double resolution, uint8_t reverse) {
+    encoder_ready[i] = 1; resolutions[i] = resolution; encoder_reverse[i] = reverse;
+}
+static uint16_t encoder_count(encoder_index_t i) { return encoder_reverse[i] ? (uint16_t)(0 - counts[i]) : counts[i]; }
+static uint8_t encoder_direction(encoder_index_t i) { return encoder_reverse[i]; }
+static uint8_t encoder_initialized(encoder_index_t i) { return i < 4 && encoder_ready[i]; }
+static double encoder_resolution(encoder_index_t i) { return resolutions[i]; }
+const hw_encoder_interface_t *get_encoder_interface(void) {
+    static const hw_encoder_interface_t value = {encoder_init, encoder_count, encoder_direction, encoder_initialized, encoder_resolution};
+    return &value;
+}
+static void pin_init(gpio_pin_t i, uint8_t mode) { if (i < NUMBER_GPIO_PINS) pins[i] = mode == GPIO_MODE_INPUT_PULLUP; }
+static uint8_t pin_get(gpio_pin_t i) { return i < NUMBER_GPIO_PINS ? pins[i] : 0; }
+static void pin_set(gpio_pin_t i, uint8_t value) { if (i < NUMBER_GPIO_PINS) pins[i] = value; }
+static void pin_toggle(gpio_pin_t i) { if (i < NUMBER_GPIO_PINS) pins[i] ^= 1; }
+static void led_init(void) { led = 0; }
+static void led_set(uint8_t value) { led = value; }
+static void led_toggle(void) { led ^= 1; }
+const gpio_interface_t *get_gpio_interface(void) {
+    static const gpio_interface_t value = {pin_init, pin_get, pin_set, pin_toggle, led_init, led_set, led_toggle};
+    return &value;
+}
+hw_temperature_status_t hw_temperature_read(uint8_t i, double *value) {
+#if NUMBER_TEMPERATURE_SENSORS == 0
+    return HW_TEMPERATURE_UNAVAILABLE;
+#else
+    if (i >= NUMBER_TEMPERATURE_SENSORS) return HW_TEMPERATURE_UNAVAILABLE;
+    if (temperature_status) return (hw_temperature_status_t)temperature_status;
+    if (now_us < 300000) return HW_TEMPERATURE_NOT_READY;
+    *value = temperature; return HW_TEMPERATURE_OK;
+#endif
+}
+hw_imu_status_t hw_imu_read(uint8_t i, hw_imu_sample_t *value) {
+#if NUMBER_IMU_SENSORS == 0
+    return HW_IMU_UNAVAILABLE;
+#else
+    if (i >= NUMBER_IMU_SENSORS) return HW_IMU_UNAVAILABLE;
+    if (imu_status) return (hw_imu_status_t)imu_status;
+    if (now_us < 50000) return HW_IMU_NOT_READY;
+    *value = imu; return HW_IMU_OK;
+#endif
+}
+hw_current_sense_status_t hw_current_sense_read(uint8_t i, double *value) {
+#if NUMBER_CURRENT_SENSORS == 0
+    return HW_CURRENT_SENSE_UNAVAILABLE;
+#else
+    if (i >= NUMBER_CURRENT_SENSORS) return HW_CURRENT_SENSE_UNAVAILABLE;
+    if (current_status[i]) return (hw_current_sense_status_t)current_status[i];
+    *value = currents[i]; return HW_CURRENT_SENSE_OK;
+#endif
+}
+bool hw_drv8873_fault_active(motorIndex i) { return i >= 4 || faults[i].fault_active; }
+uint32_t hw_motor_fault_event_sequence(uint8_t i) { return i < 4 ? fault_sequence[i] : 0; }
+bool hw_motor_read_faults(uint8_t i, hw_motor_faults_t *value) {
+    if (!SIM_HAS_DRIVER || i >= 4) return false;
+    *value = faults[i]; value->sleep_requested = !motor_ready[i]; return true;
+}
+bool hw_motor_clear_faults(uint8_t i, hw_motor_faults_t *value) {
+    if (!SIM_HAS_DRIVER || i >= 4 || !motor_ready[i]) return false;
+    motor_stop(i); faults[i] = (hw_motor_faults_t){.status_valid = true};
+    ++fault_sequence[i]; *value = faults[i]; return true;
+}
+bool hw_motor_current_limit_allowed(uint8_t i, const hw_motor_current_limit_t *value) {
+    if (!SIM_HAS_DRIVER || i >= 4 || !value || (!value->enabled && !sim_limit_can_disable[i])) return false;
+    for (unsigned n = 0; n < sim_limit_count[i]; ++n)
+        if (sim_limit_values[i][n] == value->threshold_ma) return true;
+    return false;
+}
+bool hw_motor_get_current_limit(uint8_t i, hw_motor_current_limit_t *value) {
+    if (!SIM_HAS_DRIVER || i >= 4 || !motor_ready[i]) return false;
+    *value = limits[i]; return true;
+}
+bool hw_motor_set_current_limit(uint8_t i, const hw_motor_current_limit_t *value) {
+    if (!hw_motor_current_limit_allowed(i, value) || !motor_ready[i]) return false;
+    motor_stop(i); limits[i] = *value; return true;
+}
+
+/* Wiring equivalent to the production command task's connection services,
+ * with one native stream instead of USB + I2C queues. */
+static void stop_all(void) {
+    platform_stop_velocity_controller();
+    for (uint8_t i = 0; i < 4; ++i) { controllers_manager_stop_controller(i); motor_stop(i); }
+    rx_size = 0;
+}
+static bool period_allowed(uint32_t period) { return connection_period_allowed(&session, period); }
+static uint32_t event_sequence(uint8_t topic, uint8_t i) {
+    return topic == TOPIC_MOTOR_FAULTS ? hw_motor_fault_event_sequence(i) : 0;
+}
+static bool send_bytes(uint8_t *data, uint8_t length) {
+    if (dropped[data[1]] && (data[2] || data[3])) { --dropped[data[1]]; return true; }
+    if (tx_size + length > sizeof(tx)) return false;
+    memcpy(tx + tx_size, data, length); tx_size += length; return true;
+}
+API void sim_init(void) {
+    for (unsigned i = 0; i < 4; ++i) faults[i].status_valid = true;
+    connection_init(&session, command_handler, send_bytes, hw_clock_microseconds);
+    session.services = (connection_services_t){stop_all, odometry_manager_get_period_ms, period_allowed, event_sequence};
+}
+API int sim_feed(const uint8_t *data, size_t length) {
+    if (length > sizeof(rx) - rx_size) return 0;
+    memcpy(rx + rx_size, data, length); rx_size += length; return 1;
+}
+static void run_tasks(void) {
+    for (volatile unsigned i = 0; i < task_count; ++i) {
+        if (tasks[i].due > now_us) continue;
+        active_task = &tasks[i]; delay_count = 0;
+        if (!setjmp(yield_task)) active_task->fn(active_task->arg);
+        active_task = NULL;
+    }
+}
+API int sim_poll(uint64_t time_us) {
+    if (time_us < now_us) return 6;
+    now_us = time_us;
+    /* Expire the watchdog before either controller updates or queued commands. */
+    connection_poll(&session);
+    run_tasks();
+    for (unsigned turn = 0; turn < 64; ++turn) {
+        if (rx_size && connection_can_receive(&session)) {
+            size_t size = (size_t)rx[0] + 1;
+            if (rx_size >= size) {
+                uint8_t request[255];
+                memcpy(request, rx + 1, size - 1);
+                rx_size -= size; memmove(rx, rx + size, rx_size);
+                connection_receive(&session, request, size - 1);
+            }
+        }
+        connection_poll(&session);
+    }
+    run_tasks(); /* Prime tasks created by this batch of commands at this time. */
+    return runtime_error;
+}
+API size_t sim_read(uint8_t *data, size_t capacity) {
+    size_t length = tx_size < capacity ? tx_size : capacity;
+    memcpy(data, tx, length); tx_size -= length; memmove(tx, tx + length, tx_size); return length;
+}
+API uint64_t sim_deadline(void) {
+    uint64_t next = UINT64_MAX;
+    for (unsigned i = 0; i < task_count; ++i)
+        if (tasks[i].due < next) next = tasks[i].due;
+    return next;
+}
+API void sim_disconnect(void) { connection_disconnect(&session); rx_size = tx_size = 0; }
+API int sim_lost(void) { return session.lost; }
+API int sim_ready(void) { return session.ready_announced; }
+API void sim_drop(uint8_t command, unsigned count) { dropped[command] = count; }
+API void sim_encoder(uint8_t index, uint16_t value) { if (index < 4) counts[index] = value; }
+API double sim_pwm(uint8_t i) { return i < 4 ? pwm[i] : 0; }
+API double sim_resolution(uint8_t i) { return i < 4 ? resolutions[i] : 0; }
+API int sim_reverse(uint8_t i) { return i < 4 ? motor_reverse[i] : 0; }
+API int sim_mode(uint8_t i) { return i < 4 ? motor_mode[i] : 0; }
+API void sim_temperature(double value, int status) { temperature = value; temperature_status = status; }
+API void sim_imu(const double *values, int status) { memcpy(&imu, values, sizeof(imu)); imu_status = status; }
+API void sim_current(uint8_t i, double value, int status) { if (i < 4) { currents[i] = value; current_status[i] = status; } }
+API void sim_fault(uint8_t i, int active) {
+    if (i < 4) { faults[i].fault_active = faults[i].overcurrent = active != 0; ++fault_sequence[i]; }
+}
