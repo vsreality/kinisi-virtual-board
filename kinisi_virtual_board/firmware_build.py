@@ -21,8 +21,10 @@ SOURCES = (
     "lib/protocol/protocol.c", "lib/time_sync/time_sync.c",
     "lib/initialization/initialization.c", "lib/command_requirements/command_requirements.c",
 )
+CONFIGURATION_SOURCES = ("src/controller_configuration.c", "lib/config_store/config_store.c")
 INCLUDES = ("lib/hardware", "lib/libcontrollers/src", "lib/connection", "lib/protocol",
-            "lib/time_sync", "lib/initialization", "lib/command_requirements", "lib/libutils/src")
+            "lib/time_sync", "lib/initialization", "lib/command_requirements", "lib/libutils/src",
+            "lib/config_store")
 
 
 def find_compiler(compiler=None):
@@ -75,10 +77,14 @@ def build_firmware(schema, firmware=DEFAULT_FIRMWARE, revision="0.4.0", compiler
         raise ValueError("--commands must match the selected firmware checkout's commands.json")
     board_file = firmware / "boards" / f"v{revision[:-2]}.json"
     profile = json.loads(board_file.read_text())
+    sources = SOURCES
     header = _hardware_header(profile)
+    if "SAVE_CONFIGURATION" in schema.commands:
+        sources += CONFIGURATION_SOURCES
+        header += "#define SIM_CONFIGURATION_STORAGE 1\n"
     compiler = find_compiler(compiler)
     identity = subprocess.run([compiler, "--version"], check=True, capture_output=True, text=True).stdout.splitlines()[0]
-    inputs = {p: (firmware / p).read_bytes() for p in SOURCES}
+    inputs = {p: (firmware / p).read_bytes() for p in sources}
     for directory in ("include", *INCLUDES, "tools/commands_generator"):
         for path in sorted((firmware / directory).rglob("*")):
             if path.suffix in (".h", ".py", ".jinja", ".j2"):
@@ -98,7 +104,7 @@ def build_firmware(schema, firmware=DEFAULT_FIRMWARE, revision="0.4.0", compiler
     library = cache / ("firmware.dll" if os.name == "nt" else "firmware.so")
     manifest = {"build_id": build_id, "compiler": identity, "compiler_path": compiler,
                 "firmware": str(firmware), "board": str(board_file),
-                "sources": list(SOURCES), "schema_sha256": schema.sha256}
+                "sources": list(sources), "schema_sha256": schema.sha256}
     handlers = inputs["src/command_handler.c"].decode() + inputs["lib/connection/connection.c"].decode()
     dispatch = set(re.findall(r"\bcase\s+([A-Z][A-Z_0-9]+)\s*:", handlers))
     dispatch.update(re.findall(r"(?:commandType|data\[0\])\s*==\s*([A-Z][A-Z_0-9]+)", handlers))
@@ -125,7 +131,7 @@ def build_firmware(schema, firmware=DEFAULT_FIRMWARE, revision="0.4.0", compiler
             else:
                 command += ["-static-libgcc"]
             command += ["-I" + str(firmware / inc) for inc in INCLUDES]
-            command += [str(firmware / source) for source in SOURCES]
+            command += [str(firmware / source) for source in sources]
             command += [str(SUPPORT / "runtime.c"), "-lm", "-o", str(output)]
             environment = dict(os.environ, PATH=str(Path(compiler).parent) + os.pathsep + os.environ.get("PATH", ""))
             result = subprocess.run(command, capture_output=True, text=True, env=environment)

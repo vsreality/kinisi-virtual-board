@@ -16,6 +16,7 @@ platform kinematics and subscriptions.
 | Motor velocity/position PID | Firmware `controllers_manager.c` and `lib/libcontrollers` |
 | Platform kinematics and position control | Firmware differential/omni/mecanum/platform-position sources |
 | Encoder and world odometry | Firmware odometry manager, encoder odometry and integrator |
+| Configuration save and boot restore | Firmware `controller_configuration.c` and `lib/config_store` |
 | Motor, encoder, GPIO and sensor interfaces | Native shim in `firmware_support/runtime.c` |
 | Motor response and clock advancement | Python `firmware.py` |
 | COM/TTY, PTY and TCP | Python endpoint adapters |
@@ -86,6 +87,44 @@ same stream interface as the legacy model. `ready`, `lost`, `now_us`, `schema`,
 board calls are serialized with a reentrant lock. Use `port.advance()` while an
 SDK reader thread is active. `VirtualSerial.close()` disconnects the session;
 the caller retains ownership of the board and closes it separately.
+
+## Saved configuration and virtual cold boots
+
+With firmware protocol 2.14, the native backend runs the production configuration
+capture, FRAM journal, CRC/board/version checks and restore path. Only the FRAM
+hardware boundary is replaced with an 8192-byte array. Restore runs before the
+native connection is initialized, matching the command task's ordering.
+
+`board.fram_image` returns the complete storage image. Pass those bytes to a new
+`FirmwareBoard(fram_image=image)` to simulate a cold restart. The new board loads
+an independent shared library with fresh C runtime state; only FRAM is retained.
+`disconnect()` is a connection change and does not perform a boot or restore.
+Without an image, FRAM starts erased. To retain it between processes, write the
+image to a binary file and read it into the next constructor. Standalone serial
+processes do not automatically retain FRAM across launches.
+
+`set_fram_fault(write_after_bytes=N)` interrupts writes after N bytes across
+transactions, preserving partial writes for the subsequent cold boot.
+`set_fram_fault(read_failure=True)` makes storage reads fail without mutation;
+the constructor also accepts `fram_read_failure=True` to test boot failure.
+Calling `set_fram_fault()` clears both faults. `fram_transactions` returns read
+and write transaction counts, allowing unsupported profiles to prove they never
+access storage. Storage snapshots bypass injected bus failures for inspection.
+
+Run the production-path regressions with:
+
+```powershell
+python -m unittest discover -s tests -p test_configuration.py -v
+```
+
+The tests exercise differential, omni and mecanum setup, independent encoder
+scales/directions, PWM selection, unsaved edits, reconnect, stopped restoration,
+every byte boundary of interrupted replacement saves, invalid records, read
+failures and unsupported boards. A separate-process test saves a binary image
+and starts another Python process with a fresh firmware library, checking that
+configuration survives but motor outputs, time and controller activity do not.
+This verifies application logic, not physical FRAM retention, I²C behavior,
+STM32 startup, electrical timing or MCU stack/resource use.
 
 Controller and odometry tasks run cooperatively. The shim yields at their
 `vTaskDelayUntil` boundaries using the approach in the firmware's host tests.

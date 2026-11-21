@@ -32,13 +32,20 @@ class FirmwareBoard:
     the firmware's C application, not the STM32 binary, HAL or real RTOS.
     Instances own independent shared libraries and must be closed after use.
     """
+    FRAM_SIZE = 8192
+
     def __init__(self, commands=None, *, firmware=DEFAULT_FIRMWARE, revision="0.4.0",
-                 compiler=None, max_speed=10.0, time_constant=0.05, encoder_motors=(0, 1, 2, 3)):
+                 compiler=None, max_speed=10.0, time_constant=0.05, encoder_motors=(0, 1, 2, 3),
+                 fram_image=None, fram_read_failure=False):
         self.schema = commands if isinstance(commands, Schema) else Schema(commands or Path(firmware) / "commands.json")
         if not math.isfinite(max_speed) or max_speed <= 0 or not math.isfinite(time_constant) or time_constant <= 0:
             raise ValueError("Plant max_speed and time_constant must be finite and positive")
         if len(encoder_motors) != 4 or any(type(i) is not int or not 0 <= i < 4 for i in encoder_motors):
             raise ValueError("encoder_motors must map each of the four encoders to a motor index")
+        if fram_image is not None:
+            fram_image = bytes(fram_image)
+            if len(fram_image) != self.FRAM_SIZE:
+                raise ValueError(f"FRAM image must contain exactly {self.FRAM_SIZE} bytes")
         self.revision = tuple(map(int, revision.split(".")))
         self.max_speed, self.time_constant = max_speed, time_constant
         self.encoder_motors = tuple(encoder_motors)
@@ -76,11 +83,53 @@ class FirmwareBoard:
             "imu": (None, (ct.POINTER(ct.c_double), ct.c_int)),
             "current": (None, (ct.c_uint8, ct.c_double, ct.c_int)),
             "fault": (None, (ct.c_uint8, ct.c_int)),
+            "fram_load": (ct.c_int, (ct.c_void_p, ct.c_size_t)),
+            "fram_read": (ct.c_size_t, (ct.c_void_p, ct.c_size_t)),
+            "fram_fault": (None, (ct.c_int64, ct.c_int)),
+            "fram_reads": (ct.c_uint32, ()), "fram_writes": (ct.c_uint32, ()),
         }
         for name, (result, arguments) in signatures.items():
             function = getattr(self._lib, "sim_" + name)
             function.restype, function.argtypes = result, arguments
+        if fram_image is not None:
+            self._lib.sim_fram_load(fram_image, len(fram_image))
+        self._lib.sim_fram_fault(-1, bool(fram_read_failure))
         self._lib.sim_init()
+
+    @property
+    def fram_image(self):
+        """Raw nonvolatile bytes; pass to a new board to simulate a cold boot.
+
+        A new board loads a separate library with fresh runtime globals. Do not
+        call sim_init again on the old instance: that is not a cold restart.
+        """
+        with self._lock:
+            self._check_open()
+            data = ct.create_string_buffer(self.FRAM_SIZE)
+            if self._lib.sim_fram_read(data, self.FRAM_SIZE) != self.FRAM_SIZE:
+                raise RuntimeError("Unable to read virtual FRAM image")
+            return data.raw
+
+    @property
+    def fram_transactions(self):
+        with self._lock:
+            self._check_open()
+            return (self._lib.sim_fram_reads(), self._lib.sim_fram_writes())
+
+    def set_fram_fault(self, *, write_after_bytes=None, read_failure=False):
+        """Fail writes after a byte budget, retaining already-written bytes.
+
+        The budget spans transactions until reset. None disables write failure;
+        zero fails the next write before changing storage. Read failure never
+        mutates bytes. Faults are intentionally below the production journal.
+        """
+        if write_after_bytes is not None and (type(write_after_bytes) is not int or
+                                               not 0 <= write_after_bytes < 2**63):
+            raise ValueError("Write budget must be a nonnegative int64 or None")
+        with self._lock:
+            self._check_open()
+            self._lib.sim_fram_fault(-1 if write_after_bytes is None else write_after_bytes,
+                                    bool(read_failure))
 
     def _check_open(self):
         if not self._finalizer.alive:

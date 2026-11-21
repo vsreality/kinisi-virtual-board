@@ -37,6 +37,9 @@ The current driver targets Windows 11 x64.
 
 ## Test
 
+Use the [controller firmware release test plan](docs/release-test-plan.md) for
+candidate builds, virtual-board regression, story checks and release evidence.
+
 ```powershell
 python -m unittest discover -s tests -v
 ```

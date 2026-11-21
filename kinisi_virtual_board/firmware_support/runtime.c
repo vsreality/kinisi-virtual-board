@@ -14,6 +14,10 @@
 #include "hw_motor_faults.h"
 #include "hw_motor_current_limit.h"
 #include "hw_drv8873.h"
+#ifdef SIM_CONFIGURATION_STORAGE
+#include "hw_fram.h"
+#include "controller_configuration.h"
+#endif
 #include "cmsis_os.h"
 #include "semphr.h"
 #include <math.h>
@@ -43,6 +47,43 @@ static hw_motor_faults_t faults[4];
 static uint32_t fault_sequence[4];
 static hw_motor_current_limit_t limits[4];
 static int temperature_status, imu_status, current_status[4];
+
+/* Only the physical storage boundary is simulated. Record selection, CRC,
+ * commit markers, save capture and boot restore all run production C code. */
+enum { FRAM_BYTES = 8192 };
+static uint8_t fram[FRAM_BYTES];
+static bool fram_loaded, fram_read_failure;
+static int64_t fram_write_remaining = -1;
+static uint32_t fram_reads, fram_writes;
+bool hw_fram_read(uint16_t address, void *data, uint16_t length) {
+    ++fram_reads;
+    if (!data || (size_t)address + length > sizeof(fram) || fram_read_failure) return false;
+    memcpy(data, fram + address, length);
+    return true;
+}
+bool hw_fram_write(uint16_t address, const void *data, uint16_t length) {
+    ++fram_writes;
+    if (!data || (size_t)address + length > sizeof(fram)) return false;
+    size_t written = length;
+    if (fram_write_remaining >= 0 && (uint64_t)fram_write_remaining < written)
+        written = (size_t)fram_write_remaining;
+    memcpy(fram + address, data, written);
+    if (fram_write_remaining >= 0) fram_write_remaining -= (int64_t)written;
+    return written == length;
+}
+API int sim_fram_load(const uint8_t *data, size_t length) {
+    if (!data || length != sizeof(fram)) return 0;
+    memcpy(fram, data, length); fram_loaded = true; return 1;
+}
+API size_t sim_fram_read(uint8_t *data, size_t capacity) {
+    if (!data || capacity < sizeof(fram)) return 0;
+    memcpy(data, fram, sizeof(fram)); return sizeof(fram);
+}
+API void sim_fram_fault(int64_t write_after_bytes, int read_failure) {
+    fram_write_remaining = write_after_bytes; fram_read_failure = read_failure != 0;
+}
+API uint32_t sim_fram_reads(void) { return fram_reads; }
+API uint32_t sim_fram_writes(void) { return fram_writes; }
 
 typedef struct { void (*fn)(void *); void *arg; uint64_t due; int primed; } task_t;
 static task_t tasks[4], *active_task;
@@ -102,6 +143,11 @@ bool hw_motor_set_pwm_frequency(uint32_t value) {
     pwm_frequency = value;
     return true;
 }
+void hw_motor_discard_restored_setup(void) {
+    hw_motor_set_pwm_frequency(SIM_PWM_DEFAULT);
+    memset(motor_ready, 0, sizeof(motor_ready));
+    memset(motor_reverse, 0, sizeof(motor_reverse));
+}
 static void motor_brake(motorIndex i) { pwm[i] = 0; motor_mode[i] = 1; }
 static void motor_init(motorIndex i, bool reverse) {
     motor_stop(i); motor_ready[i] = !(SIM_HAS_DRIVER && faults[i].fault_active); motor_reverse[i] = reverse;
@@ -120,8 +166,18 @@ const hw_motor_interface_t *get_motor_interface(void) {
 static void encoder_init(encoder_index_t i, double resolution, uint8_t reverse) {
     encoder_ready[i] = 1; resolutions[i] = resolution; encoder_reverse[i] = reverse;
 }
+bool hw_encoder_try_initialize(encoder_index_t i, double resolution, uint8_t reverse) {
+    if (i >= 4) return false;
+    encoder_init(i, resolution, reverse); return true;
+}
+void hw_encoder_discard_restored_setup(void) {
+    memset(encoder_ready, 0, sizeof(encoder_ready));
+    memset(encoder_reverse, 0, sizeof(encoder_reverse));
+    memset(resolutions, 0, sizeof(resolutions));
+}
 static uint16_t encoder_count(encoder_index_t i) { return encoder_reverse[i] ? (uint16_t)(0 - counts[i]) : counts[i]; }
 static uint8_t encoder_direction(encoder_index_t i) { return encoder_reverse[i]; }
+uint8_t hw_encoder_is_reversed(encoder_index_t i) { return i < 4 ? encoder_reverse[i] : 0; }
 static uint8_t encoder_initialized(encoder_index_t i) { return i < 4 && encoder_ready[i]; }
 static double encoder_resolution(encoder_index_t i) { return resolutions[i]; }
 const hw_encoder_interface_t *get_encoder_interface(void) {
@@ -211,7 +267,11 @@ static bool send_bytes(uint8_t *data, uint8_t length) {
     memcpy(tx + tx_size, data, length); tx_size += length; return true;
 }
 API void sim_init(void) {
+    if (!fram_loaded) { memset(fram, 0xff, sizeof(fram)); fram_loaded = true; }
     for (unsigned i = 0; i < 4; ++i) faults[i].status_valid = true;
+#ifdef SIM_CONFIGURATION_STORAGE
+    controller_configuration_restore();
+#endif
     connection_init(&session, command_handler, send_bytes, hw_clock_microseconds);
     session.services = (connection_services_t){stop_all, odometry_manager_get_period_ms, period_allowed, event_sequence};
 }
