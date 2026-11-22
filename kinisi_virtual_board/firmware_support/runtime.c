@@ -108,6 +108,9 @@ API uint32_t sim_fram_writes(void) { return fram_writes; }
 typedef struct { void (*fn)(void *); void *arg; uint64_t due; int primed; } task_t;
 static task_t tasks[4], *active_task;
 static unsigned task_count, delay_count, mutex_count;
+static task_t *controller_task;
+static uint64_t controller_dispatches;
+API uint64_t sim_controller_dispatches(void) { return controller_dispatches; }
 static uint8_t mutexes[8];
 static jmp_buf yield_task;
 
@@ -116,10 +119,10 @@ static jmp_buf yield_task;
  * yield at the next loop boundary, exactly as the existing firmware host tests.
  * This is deterministic cooperative stepping, not a port of FreeRTOS. */
 osThreadId_t osThreadNew(void (*fn)(void *), void *arg, const osThreadAttr_t *attr) {
-    (void)attr;
     if (task_count == 4) { runtime_error = 1; return NULL; }
     task_t *task = &tasks[task_count++];
     *task = (task_t){.fn = fn, .arg = arg, .due = now_us};
+    if (attr && attr->name && strcmp(attr->name, "ControllerTask") == 0) controller_task = task;
     return task;
 }
 osThreadState_t osThreadGetState(osThreadId_t task) { return task ? 0 : osThreadError; }
@@ -337,6 +340,7 @@ static void run_tasks(void) {
     for (volatile unsigned i = 0; i < task_count; ++i) {
         if (tasks[i].due > now_us) continue;
         active_task = &tasks[i]; delay_count = 0;
+        if (active_task == controller_task && active_task->primed) ++controller_dispatches;
         if (!setjmp(yield_task)) active_task->fn(active_task->arg);
         active_task = NULL;
     }
@@ -421,6 +425,7 @@ API int sim_ready(void) { return session.ready_announced; }
 #endif
 API void sim_drop(uint8_t command, unsigned count) { dropped[command] = count; }
 API void sim_encoder(uint8_t index, uint16_t value) { if (index < 4) counts[index] = value; }
+API uint16_t sim_encoder_count(uint8_t i) { return i < 4 ? counts[i] : 0; }
 API double sim_resolution(uint8_t i) { return i < 4 ? resolutions[i] : 0; }
 #ifndef SIM_DRIVER_HAL
 API double sim_pwm(uint8_t i) { return i < 4 ? pwm[i] : 0; }

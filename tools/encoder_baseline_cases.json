@@ -1,0 +1,37 @@
+{
+  "format": 1,
+  "revision": "0.4.0",
+  "step_ms": 10,
+  "seeds": [131, 277, 419, 587, 743],
+  "presets": {
+    "differential": {"wheel_diameter": 0.1, "wheel_base": 0.3},
+    "omni": {"wheel_diameter": 0.1, "robot_radius": 0.17},
+    "mecanum": {"wheel_diameter": 0.1, "width": 0.26, "length": 0.34}
+  },
+  "encoder_counts_per_rev": 4096,
+  "wheel_pid": {"kp": 10, "ki": 20, "kd": 0, "integral_limit": 100},
+  "position_pid": {"linear_kp": 2, "angular_kp": 2, "max_linear_speed": 0.15, "max_angular_speed": 1, "position_tolerance": 0.005, "heading_tolerance": 0.01},
+  "surfaces": {
+    "nominal": [],
+    "wheel0_slip": [[1450, 4250, [0.38, 1, 1, 1]], [5900, 7650, [0.60, 1, 1, 1]]],
+    "common_slip": [[1450, 4250, [0.55, 0.55, 0.55, 0.55]], [5900, 7650, [0.72, 0.72, 0.72, 0.72]]]
+  },
+  "courses": {
+    "velocity": {
+      "duration_ms": 10000,
+      "targets": [[0, [0, 0, 0]], [800, [0.15, 0, 0]], [2600, [0.10, 0.055, 0.55]], [4800, [0, 0, 0]], [5600, [-0.09, -0.045, -0.42]], [7600, [0, 0, 0.4]], [8700, [0, 0, 0]]]
+    },
+    "position": {
+      "duration_ms": 12500,
+      "targets": [[0, [0, 0, 0]], [800, [0.23, 0.07, 0.45]], [5500, [0.11, -0.06, -0.40]], [9600, [0.11, -0.06, 0.15]]]
+    }
+  },
+  "held_out": {
+    "seeds": [1103, 1289, 1423],
+    "surfaces": {"wheel1_slip": [[2100, 4400, [1, 0.48, 1, 1]], [8300, 9450, [0.78, 0.78, 0.78, 0.78]]]},
+    "courses": {
+      "velocity": {"duration_ms": 11200, "targets": [[0, [0, 0, 0]], [970, [0.12, -0.04, -0.3]], [3410, [0, 0, 0]], [4230, [-0.10, 0.05, 0.45]], [7420, [0.08, 0.02, 0]], [9800, [0, 0, 0]]]},
+      "position": {"duration_ms": 12500, "targets": [[0, [0, 0, 0]], [970, [0.16, -0.09, -0.5]], [5850, [0.06, 0.13, 0.38]], [9400, [0.06, 0.13, -0.1]]]}
+    }
+  }
+}

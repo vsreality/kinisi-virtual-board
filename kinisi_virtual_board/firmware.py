@@ -77,6 +77,8 @@ class FirmwareBoard:
             "read": (ct.c_size_t, (ct.c_void_p, ct.c_size_t)),
             "disconnect": (None, ()), "lost": (ct.c_int, ()), "ready": (ct.c_int, ()),
             "drop": (None, (ct.c_uint8, ct.c_uint)), "encoder": (None, (ct.c_uint8, ct.c_uint16)),
+            "controller_dispatches": (ct.c_uint64, ()),
+            "encoder_count": (ct.c_uint16, (ct.c_uint8,)),
             "pwm": (ct.c_double, (ct.c_uint8,)), "resolution": (ct.c_double, (ct.c_uint8,)),
             "reverse": (ct.c_int, (ct.c_uint8,)), "mode": (ct.c_int, (ct.c_uint8,)),
             "temperature": (None, (ct.c_double, ct.c_int)),
@@ -174,6 +176,20 @@ class FirmwareBoard:
         with self._lock:
             self._check_open()
             return bool(self._lib.sim_lost())
+
+    @property
+    def controller_dispatches(self):
+        """Number of scheduled controller task activations after its startup delay."""
+        with self._lock:
+            self._check_open()
+            return self._lib.sim_controller_dispatches()
+
+    @property
+    def encoder_counts(self):
+        """Raw 16-bit counter registers at the simulated encoder boundary."""
+        with self._lock:
+            self._check_open()
+            return tuple(self._lib.sim_encoder_count(i) for i in range(4))
 
     @property
     def motor_pwm(self):
