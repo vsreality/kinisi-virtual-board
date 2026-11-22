@@ -17,6 +17,7 @@ TIM_TypeDef test_timers[12];
 static TIM_HandleTypeDef handles[12];
 static uint8_t registers[NUMBER_MOTORS][6];
 static bool corrupt_limit[NUMBER_MOTORS];
+static bool sleep_readback_high[NUMBER_MOTORS];
 static bool injected_fault[NUMBER_MOTORS];
 
 static bool high(gpio_info_t pin) { return (pin.port->IDR & pin.pin) != 0; }
@@ -56,6 +57,8 @@ void HAL_GPIO_Init(GPIO_TypeDef *port, GPIO_InitTypeDef *config) {
     if (config->Mode == GPIO_MODE_IT_RISING_FALLING) port->IDR |= config->Pin;
 }
 GPIO_PinState HAL_GPIO_ReadPin(GPIO_TypeDef *port, uint16_t pin) {
+    for (unsigned i = 0; i < NUMBER_MOTORS; ++i)
+        if (sleep_readback_high[i] && matches(motor_info[i].sleep, port, pin)) return GPIO_PIN_SET;
     return port->IDR & pin ? GPIO_PIN_SET : GPIO_PIN_RESET;
 }
 void HAL_GPIO_WritePin(GPIO_TypeDef *port, uint16_t pin, GPIO_PinState state) {
@@ -97,6 +100,11 @@ HAL_StatusTypeDef HAL_SPI_TransmitReceive(SPI_HandleTypeDef *spi, uint8_t *tx, u
         }
     }
     return HAL_OK;
+}
+API int sim_sleep_readback_failure(uint8_t i, int active) {
+    if (i >= NUMBER_MOTORS) return 0;
+    sleep_readback_high[i] = active != 0;
+    return 1;
 }
 API int sim_wake_readback_failure(uint8_t i, int active) {
     if (i >= NUMBER_MOTORS) return 0;

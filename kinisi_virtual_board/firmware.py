@@ -83,10 +83,12 @@ class FirmwareBoard:
             "imu": (None, (ct.POINTER(ct.c_double), ct.c_int)),
             "current": (None, (ct.c_uint8, ct.c_double, ct.c_int)),
             "fault": (None, (ct.c_uint8, ct.c_int)),
+            "sleep_readback_failure": (ct.c_int, (ct.c_uint8, ct.c_int)),
             "wake_readback_failure": (ct.c_int, (ct.c_uint8, ct.c_int)),
             "fram_load": (ct.c_int, (ct.c_void_p, ct.c_size_t)),
             "fram_read": (ct.c_size_t, (ct.c_void_p, ct.c_size_t)),
             "fram_fault": (None, (ct.c_int64, ct.c_int)),
+            "temperature_reads": (ct.c_uint64, ()), "imu_reads": (ct.c_uint64, ()),
             "fram_reads": (ct.c_uint32, ()), "fram_writes": (ct.c_uint32, ()),
         }
         for name, (result, arguments) in signatures.items():
@@ -110,6 +112,13 @@ class FirmwareBoard:
             if self._lib.sim_fram_read(data, self.FRAM_SIZE) != self.FRAM_SIZE:
                 raise RuntimeError("Unable to read virtual FRAM image")
             return data.raw
+
+    @property
+    def sensor_read_counts(self):
+        """Count calls into the virtual sensor hardware, including explicit reads."""
+        with self._lock:
+            self._check_open()
+            return {"temperature": self._lib.sim_temperature_reads(), "imu": self._lib.sim_imu_reads()}
 
     @property
     def fram_transactions(self):
@@ -244,6 +253,14 @@ class FirmwareBoard:
         with self._lock:
             self._check_open()
             self._lib.sim_fault(index, active)
+
+    def set_sleep_readback_failure(self, index, active=True):
+        """Force the selected channel's nSLEEP readback high until cleared."""
+        self._index(index)
+        with self._lock:
+            self._check_open()
+            if not self._lib.sim_sleep_readback_failure(index, active):
+                raise ValueError("Selected firmware has no simulated driver sleep pins")
 
     def set_wake_readback_failure(self, index, active=True):
         """Corrupt the channel's IC4 readback after writes until cleared."""

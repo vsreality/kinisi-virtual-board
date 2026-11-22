@@ -314,7 +314,8 @@ class BoardTests(unittest.TestCase):
             "CLEAR_MOTOR_FAULTS", "GET_MOTOR_CURRENT", "GET_MOTOR_CURRENT_LIMIT",
             "GET_MOTOR_FAULTS", "SET_MOTOR_CURRENT_LIMIT", "SUBSCRIBE_CONFIGURED", "SUBSCRIBE_WITH_MODE"]
         expected += [name for name in ("GET_PWM_FREQUENCY", "SET_PWM_FREQUENCY",
-                                      "SAVE_CONFIGURATION", "GET_CONFIGURATION_FIELD", "SET_DRIVER_SLEEP", "GET_DRIVER_SLEEP")
+                                      "SAVE_CONFIGURATION", "GET_CONFIGURATION_FIELD", "SET_DRIVER_SLEEP", "GET_DRIVER_SLEEP",
+                                      "SET_BOARD_IDLE", "GET_BOARD_IDLE")
                      if name in self.board.schema.commands]
         self.assertEqual(self.board.unsupported_commands, sorted(expected))
 

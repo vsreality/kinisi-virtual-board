@@ -6,6 +6,9 @@
 #include "odometry_manager.h"
 #include "platform.h"
 #include "hw_config.h"
+#if BOARD_HAS_BOARD_IDLE
+#include "wake_barriers.h"
+#endif
 #include "hw_clock.h"
 #include "hw_gpio.h"
 #include "hw_temperature.h"
@@ -38,6 +41,14 @@ static uint8_t rx[65536], tx[65536];
 static size_t rx_size, tx_size;
 #ifdef SIM_DRIVER_HAL
 static size_t bytes_before_wake;
+static bool consume_mark(size_t *marked, size_t frame_size) {
+    bool stale = *marked != 0;
+    *marked = *marked > frame_size ? *marked - frame_size : 0;
+    return stale;
+}
+#if BOARD_HAS_BOARD_IDLE
+static size_t bytes_before_board_wake;
+#endif
 #endif
 static unsigned dropped[256];
 static int runtime_error;
@@ -202,7 +213,11 @@ const gpio_interface_t *get_gpio_interface(void) {
     static const gpio_interface_t value = {pin_init, pin_get, pin_set, pin_toggle, led_init, led_set, led_toggle};
     return &value;
 }
+static uint64_t temperature_reads, imu_reads;
+API uint64_t sim_temperature_reads(void) { return temperature_reads; }
+API uint64_t sim_imu_reads(void) { return imu_reads; }
 hw_temperature_status_t hw_temperature_read(uint8_t i, double *value) {
+    ++temperature_reads;
 #if NUMBER_TEMPERATURE_SENSORS == 0
     return HW_TEMPERATURE_UNAVAILABLE;
 #else
@@ -213,6 +228,7 @@ hw_temperature_status_t hw_temperature_read(uint8_t i, double *value) {
 #endif
 }
 hw_imu_status_t hw_imu_read(uint8_t i, hw_imu_sample_t *value) {
+    ++imu_reads;
 #if NUMBER_IMU_SENSORS == 0
     return HW_IMU_UNAVAILABLE;
 #else
@@ -268,6 +284,9 @@ static void stop_all(void) {
     rx_size = 0;
 #ifdef SIM_DRIVER_HAL
     bytes_before_wake = 0;
+#if BOARD_HAS_BOARD_IDLE
+    bytes_before_board_wake = 0;
+#endif
 #endif
 }
 static bool period_allowed(uint32_t period) { return connection_period_allowed(&session, period); }
@@ -320,11 +339,20 @@ API int sim_poll(uint64_t time_us) {
 #ifdef SIM_DRIVER_HAL
                 // As in the firmware ingress queues, a frame whose first byte
                 // was buffered at wake remains marked through later fragments.
-                bool stale = bytes_before_wake != 0;
-                bytes_before_wake = bytes_before_wake > size ? bytes_before_wake - size : 0;
+                bool before_driver_wake = consume_mark(&bytes_before_wake, size);
+#if BOARD_HAS_BOARD_IDLE
+                bool was_idle = connection_board_idle();
+                uint8_t stale = before_driver_wake ? BEFORE_DRIVER_WAKE : 0;
+                if (consume_mark(&bytes_before_board_wake, size)) stale |= BEFORE_BOARD_WAKE;
+#else
+                bool stale = before_driver_wake;
+#endif
                 bool was_asleep = hw_motor_drivers_sleeping();
                 connection_receive_queued(&session, request, size - 1, stale);
                 if (was_asleep && !hw_motor_drivers_sleeping()) bytes_before_wake = rx_size;
+#if BOARD_HAS_BOARD_IDLE
+                if (was_idle && !connection_board_idle()) bytes_before_board_wake = rx_size;
+#endif
 #else
                 connection_receive(&session, request, size - 1);
 #endif
@@ -350,6 +378,9 @@ API void sim_disconnect(void) {
     rx_size = tx_size = 0;
 #ifdef SIM_DRIVER_HAL
     bytes_before_wake = 0;
+#if BOARD_HAS_BOARD_IDLE
+    bytes_before_board_wake = 0;
+#endif
 #endif
 }
 API int sim_lost(void) { return session.lost; }
@@ -372,5 +403,6 @@ API void sim_fault(uint8_t i, int active) {
 // Profiles with no physical sleep control always have an inactive latch.
 bool hw_motor_drivers_sleeping(void) { return false; }
 bool hw_motor_set_driver_sleep(bool sleeping) { (void)sleeping; return false; }
+API int sim_sleep_readback_failure(uint8_t i, int active) { return 0; }
 API int sim_wake_readback_failure(uint8_t i, int active) { return 0; }
 #endif
