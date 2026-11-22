@@ -113,7 +113,8 @@ def configure(wire, spec, preset, mode):
     return rates, readback
 
 
-def run_case(directory, firmware, spec, preset, mode, surface, seed):
+def run_case(directory, firmware, spec, preset, mode, surface, seed, *, setup=None, stationary_warmup=False):
+    """Call setup(ask) after configuration, then optionally feed stationary IMU samples before the course."""
     directory.mkdir()
     rng = random.Random(seed)
     speed = rng.uniform(9.4, 10.6)
@@ -130,7 +131,22 @@ def run_case(directory, firmware, spec, preset, mode, surface, seed):
                        time_constant=motor_tau) as board, ExitStack() as files:
         wire = Wire(board)
         rates, readback = configure(wire, spec, preset, mode)
-        board.advance(.6 - dt)
+        if setup is not None:
+            setup(wire.ask)
+        if stationary_warmup:
+            # Match the course bias while drawing pre-course noise from a separate stream.
+            stationary = VirtualIMU(seed + 10000, noise_seed=f"stationary-warmup:{seed}")
+            if not 1 <= dt_ms <= 600:
+                raise ValueError("Warm-up needs an observation period between 1 and 600 ms")
+            periods, offset_ms = divmod(600, dt_ms)
+            board.advance(offset_ms / 1000)
+            for _ in range(periods - 1):
+                acquired_us = board.now_us
+                values = stationary.sample((0., 0., 9.80665), 0.)
+                board.advance(dt)
+                board.set_imu(values[:3], values[3:], accel_us=acquired_us, gyro_us=acquired_us)
+        else:
+            board.advance(.6 - dt)
         previous_imu = imu.sample((0., 0., 9.80665), 0.)
         previous_imu_us = board.now_us
         board.advance(dt)
@@ -139,6 +155,10 @@ def run_case(directory, firmware, spec, preset, mode, surface, seed):
                         max_speed_rad_s=speed, motor_tau_s=motor_tau, body_tau_s=chassis.response_s,
                         imu_bias=imu.bias, rates=rates, configuration_readback=readback, firmware_build_id=board.build["build_id"],
                         schema_sha256=board.schema.sha256, duration_ms=recipe["duration_ms"])
+        if stationary_warmup:
+            metadata["stationary_warmup_ms"] = 600
+        if setup is not None:
+            metadata["client_setup"] = True
         dump(directory/"case.json", metadata)
         if not (directory.parent/"firmware-build.json").exists():
             dump(directory.parent/"firmware-build.json", board.build)

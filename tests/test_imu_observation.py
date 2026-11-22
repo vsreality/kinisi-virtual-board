@@ -89,3 +89,33 @@ class IMUObservationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as folder, patch.object(encoder_baseline, "FirmwareBoard", RecordingBoard):
             encoder_baseline.run_case(Path(folder) / "case", FIRMWARE, cases, "differential", "velocity", "nominal", 131)
         self.assertEqual(observations, [(t, 0, t - 10000, t - 10000) for t in range(600000, 640000, 10000)])
+
+    def test_stationary_warmup_is_delayed_and_preserves_course(self):
+        deliveries = []
+
+        class RecordingBoard(FirmwareBoard):
+            def set_imu(self, acceleration, angular_velocity, **times):
+                super().set_imu(acceleration, angular_velocity, **times)
+                deliveries.append((self.now_us, times, (*acceleration, *angular_velocity)))
+
+        def setup(ask):
+            self.assertFalse(deliveries)
+            self.assertEqual(ask("GET_ODOMETRY_FREQUENCY"), bytes([50, 0]))
+            setup_calls.append(True)
+
+        setup_calls = []
+        cases = json.loads(encoder_baseline.CASES.read_text(encoding="utf-8"))
+        cases["courses"]["position"]["duration_ms"] = 30
+        args = FIRMWARE, cases, "omni", "position", "nominal", 131
+        with tempfile.TemporaryDirectory() as folder:
+            plain, warm = Path(folder) / "plain", Path(folder) / "warm"
+            encoder_baseline.run_case(plain, *args)
+            with patch.object(encoder_baseline, "FirmwareBoard", RecordingBoard):
+                encoder_baseline.run_case(warm, *args, setup=setup, stationary_warmup=True)
+            for name in ("sensors.csv", "firmware.csv", "reference.csv", "targets.csv"):
+                self.assertEqual((plain / name).read_bytes(), (warm / name).read_bytes(), name)
+        self.assertEqual(setup_calls, [True])
+        self.assertEqual([t for t, _, _ in deliveries], list(range(10000, 640000, 10000)))
+        for t, times, _ in deliveries:
+            self.assertEqual(times, dict(accel_us=t - 10000, gyro_us=t - 10000))
+        self.assertGreater(len({values for t, _, values in deliveries if t < 600000}), 1)

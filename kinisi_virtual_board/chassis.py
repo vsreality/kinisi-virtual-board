@@ -55,10 +55,12 @@ class Chassis:
 
 class VirtualIMU:
     """Fixed board-aligned mount at chassis origin; output is in BMI088 native axes."""
-    def __init__(self, seed):
+    def __init__(self, seed, *, noise_seed=None):
         self.rng = random.Random(seed)
         self.bias = [self.rng.uniform(-.035, .035) for _ in range(3)]
         self.bias += [self.rng.uniform(-.004, .004) for _ in range(3)]
+        if noise_seed is not None:
+            self.rng.seed(noise_seed)
 
     def sample(self, specific_force, yaw_rate):
         values = (-specific_force[0], -specific_force[1], specific_force[2], 0., 0., yaw_rate)
