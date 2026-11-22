@@ -259,3 +259,20 @@ output reading low. After explicit release, a fresh brake produces high/high on
 the addressed channels. Ordinary coast produces low/low and permits immediate
 drive. These observations describe settled simulated outputs. Oscilloscope
 waveforms, transient timing, first-drive latency and current draw require hardware.
+
+## Shallow board idle on original v0.3 and Nano
+
+Protocol 2.18 enables the existing `SET_BOARD_IDLE` and `GET_BOARD_IDLE` commands
+on both DRV8870 revisions. Within an established USB session, a PING or time read
+is serviced while logical idle remains set. An interrupt may wake the physical CPU
+to handle work. An explicit `SET_BOARD_IDLE(0)` exits the protocol mode and
+restores the prior driver-inhibit policy. Outputs stay low until a fresh drive
+or brake command is accepted.
+
+The native tests run the production command and motor code. The motor HAL's
+`motor_pad_touched("A", 9)` records any GPIO configuration or write since boot,
+including a temporary one. Nano uses PA9 for VBUS and PA10 for M3 IN2. Its USB
+attach/detach policy is exercised in the firmware host fixtures, including the
+Nano command task with the production USB lifecycle during an idle session. The simulator models settled pin outputs and protocol state. Embedded
+instruction selection, time in WFI, physical current and wake latency require
+separate evidence.

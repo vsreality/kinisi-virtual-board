@@ -285,10 +285,17 @@ class BoardIdleTests(unittest.TestCase):
         session.require_state(1, 1)
         self.assertTrue(board.ready)
 
-    def test_v03_unsupported_both_directions_and_query(self):
+    def test_v03_board_idle_contract_by_protocol(self):
         board, session = self.board("0.3.0")
         session.ok("INITIALIZE_MOTOR")
         session.ok("SET_MOTOR_SPEED", pwm=25)
+        if board.schema.version >= (2, 18, 0):
+            session.idle(1)
+            session.require_state(1, 1)
+            session.idle(0)
+            session.require_state(0, 0)
+            self.assertEqual(board.motor_pwm[0], 0.)
+            return
         for idle in (0, 1):
             session.error("SET_BOARD_IDLE", "SENSOR_NOT_AVAILABLE", idle=idle)
         session.error("GET_BOARD_IDLE", "SENSOR_NOT_AVAILABLE")

@@ -59,11 +59,13 @@ class Peer:
         assert identity[:4] == bytes((1, *self.board.revision)), identity
 
 
-class Drv8870Tests(unittest.TestCase):
+class Drv8870Fixture(unittest.TestCase):
+    minimum_version = (2, 17, 0)
+
     def setUp(self):
         version = json.loads((FIRMWARE / "commands.json").read_text())["version"]
-        if tuple(map(int, version.split("."))) < (2, 17, 0):
-            self.skipTest("Selected firmware predates DRV8870 sleep")
+        if tuple(map(int, version.split("."))) < self.minimum_version:
+            self.skipTest(f"Requires firmware protocol {self.minimum_version}")
 
     def board(self, revision):
         board = FirmwareBoard(firmware=FIRMWARE, revision=revision)
@@ -80,6 +82,8 @@ class Drv8870Tests(unittest.TestCase):
         self.assertEqual(self.pairs(board), [(GPIO_LOW, GPIO_LOW)] * 4)
         self.assertEqual(board.motor_pwm, (0.,) * 4)
 
+
+class Drv8870Tests(Drv8870Fixture):
     def test_production_timer_and_pad_assignments(self):
         for revision in REVISIONS:
             with self.subTest(revision=revision):
@@ -127,7 +131,10 @@ class Drv8870Tests(unittest.TestCase):
                     peer = Peer(b, bus)
                     peer.initialize()
                     self.held(b)
-                    peer.issue("GET_BOARD_IDLE", error="SENSOR_NOT_AVAILABLE")
+                    if b.schema.version < (2, 18, 0):
+                        peer.issue("GET_BOARD_IDLE", error="SENSOR_NOT_AVAILABLE")
+                    else:
+                        self.assertEqual(peer.issue("GET_BOARD_IDLE"), bytes([0]))
                     # Leave M1/M2 uninitialized; exercise M3's revision-specific second pin.
                     for i in (0, 3):
                         peer.issue("INITIALIZE_MOTOR", motor_index=i)

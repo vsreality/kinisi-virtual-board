@@ -96,6 +96,7 @@ class FirmwareBoard:
             signatures.update({
                 "usb_busy": (None, (ct.c_int,)),
                 "timer_ticks": (ct.c_int, (ct.c_uint, ct.c_uint)),
+                "motor_pad_touched": (ct.c_int, (ct.c_uint, ct.c_uint)),
                 "pad_af": (ct.c_int, (ct.c_uint, ct.c_uint)),
                 "pad": (ct.c_int, (ct.c_uint, ct.c_uint, ct.POINTER(ct.c_int))),
                 "low_dwell_ms": (ct.c_uint64, ()),
@@ -204,6 +205,14 @@ class FirmwareBoard:
         with self._lock:
             self._check_drv8870()
             return self._lib.sim_timer_ticks(timer, channel)
+
+    def motor_pad_touched(self, bank, bit):
+        """Whether motor firmware has ever configured or written this pad since boot."""
+        if bank not in ("A", "B", "C", "D", "E") or type(bit) is not int or not 0 <= bit <= 15:
+            raise ValueError("Expected GPIO bank A..E and bit 0..15")
+        with self._lock:
+            self._check_drv8870()
+            return bool(self._lib.sim_motor_pad_touched(ord(bank) - ord("A"), bit))
 
     def pad_alternate_function(self, bank, bit):
         """Alternate function selected by HAL_GPIO_Init, or -1 in GPIO mode."""

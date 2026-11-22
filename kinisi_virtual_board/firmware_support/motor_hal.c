@@ -44,7 +44,11 @@ uint32_t get_alternate_function_mapping(TIM_TypeDef *timer) {
 void rcc_gpio_clk_enable(GPIO_TypeDef *port) {}
 void rcc_tim_clk_enable(TIM_TypeDef *timer) {}
 #if BOARD_HAS_DRV8870_SLEEP
-static uint16_t output_pins[5], alternate_pins[5];
+static uint16_t output_pins[5], alternate_pins[5], touched_pins[5];
+
+API int sim_motor_pad_touched(unsigned bank, unsigned bit) {
+    return bank < 5 && bit < 16 && (touched_pins[bank] & (1u << bit)) != 0;
+}
 static uint64_t low_dwell_ms;
 static uint16_t af_pins[5][16];
 static uint8_t normal_polarity[12][4];
@@ -133,6 +137,7 @@ HAL_StatusTypeDef HAL_TIMEx_PWMN_Start(TIM_HandleTypeDef *t, uint32_t channel) {
 void HAL_GPIO_Init(GPIO_TypeDef *port, GPIO_InitTypeDef *config) {
 #if BOARD_HAS_DRV8870_SLEEP
     size_t bank = port - test_ports;
+    touched_pins[bank] |= config->Pin;
     output_pins[bank] &= ~config->Pin;
     alternate_pins[bank] &= ~config->Pin;
     if (config->Mode == GPIO_MODE_OUTPUT_PP) output_pins[bank] |= config->Pin;
@@ -157,6 +162,9 @@ GPIO_PinState HAL_GPIO_ReadPin(GPIO_TypeDef *port, uint16_t pin) {
     return port->IDR & pin ? GPIO_PIN_SET : GPIO_PIN_RESET;
 }
 void HAL_GPIO_WritePin(GPIO_TypeDef *port, uint16_t pin, GPIO_PinState state) {
+#if BOARD_HAS_DRV8870_SLEEP
+    touched_pins[port - test_ports] |= pin;
+#endif
     if (state == GPIO_PIN_SET) {
         port->ODR |= pin;
         port->IDR |= pin;
