@@ -78,14 +78,20 @@ def build_firmware(schema, firmware=DEFAULT_FIRMWARE, revision="0.4.0", compiler
     board_file = firmware / "boards" / f"v{revision[:-2]}.json"
     profile = json.loads(board_file.read_text())
     sources = SOURCES
+    includes = INCLUDES
+    driver_hal = "SET_DRIVER_SLEEP" in schema.commands and profile["motors"]["control_model"] == "enable_direction"
     header = _hardware_header(profile)
+    if driver_hal:
+        sources += ("lib/hardware/hw_motor.c", "lib/hardware/hw_drv8873.c")
+        includes += ("test/test_motor_control/stubs",)
+        header = '#pragma once\n#include "sim_pin_map.h"\n#define SIM_DRIVER_HAL 1\n'
     if "SAVE_CONFIGURATION" in schema.commands:
         sources += CONFIGURATION_SOURCES
         header += "#define SIM_CONFIGURATION_STORAGE 1\n"
     compiler = find_compiler(compiler)
     identity = subprocess.run([compiler, "--version"], check=True, capture_output=True, text=True).stdout.splitlines()[0]
     inputs = {p: (firmware / p).read_bytes() for p in sources}
-    for directory in ("include", *INCLUDES, "tools/commands_generator"):
+    for directory in ("include", *includes, "tools/commands_generator"):
         for path in sorted((firmware / directory).rglob("*")):
             if path.suffix in (".h", ".py", ".jinja", ".j2"):
                 inputs[str(path.relative_to(firmware)).replace("\\", "/")] = path.read_bytes()
@@ -115,6 +121,8 @@ def build_firmware(schema, firmware=DEFAULT_FIRMWARE, revision="0.4.0", compiler
             stage = Path(folder)
             include = stage / "include"
             shutil.copytree(firmware / "include", include)
+            if driver_hal:
+                (include / "hw_config.h").rename(include / "sim_pin_map.h")
             (include / "hw_config.h").write_text(header)
             (include / "commands.h").unlink(missing_ok=True)
             command = [sys.executable, str(firmware / "tools/commands_generator/generator.py"),
@@ -130,8 +138,10 @@ def build_firmware(schema, firmware=DEFAULT_FIRMWARE, revision="0.4.0", compiler
                 command += ["-fPIC"]
             else:
                 command += ["-static-libgcc"]
-            command += ["-I" + str(firmware / inc) for inc in INCLUDES]
+            command += ["-I" + str(firmware / inc) for inc in includes]
             command += [str(firmware / source) for source in sources]
+            if driver_hal:
+                command.append(str(SUPPORT / "motor_hal.c"))
             command += [str(SUPPORT / "runtime.c"), "-lm", "-o", str(output)]
             environment = dict(os.environ, PATH=str(Path(compiler).parent) + os.pathsep + os.environ.get("PATH", ""))
             result = subprocess.run(command, capture_output=True, text=True, env=environment)

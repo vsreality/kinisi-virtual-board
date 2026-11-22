@@ -217,3 +217,20 @@ exercised. The Windows COM-pair test remains opt-in because no virtual pair is
 installed. Node is absent in Linux here, so its JavaScript integration skips.
 Firmware/SDK schemas and generated artifacts are unchanged; the synchronization
 audit covers all three SDKs, including Arduino.
+
+
+## Driver sleep on v0.4
+
+With a firmware checkout that exposes `SET_DRIVER_SLEEP`, the v0.4 build links
+production `hw_motor.c` and `hw_drv8873.c`. The plant reads the resulting GPIO
+and timer states, including the 840-step PWM duty. Each simulated driver has
+its own SPI register bank. Asserting sleep clears its registers. The host uses
+the firmware's motor-control test HAL header for the peripheral declarations.
+HAL delays consume no wall time, so this tests command sequencing and readback;
+wake timing, electrical behavior and current draw require hardware.
+
+Run `python -m unittest discover -s tests -p test_driver_sleep.py -v` against
+protocol 2.15 firmware. In the Python harness,
+`board.set_wake_readback_failure(2)` corrupts channel 2's current-limit register
+on write. Pass `False` as the second argument to allow verified writes again.
+The injection applies during initialization as well as wake.

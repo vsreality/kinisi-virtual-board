@@ -36,6 +36,9 @@ static uint64_t now_us;
 static connection_t session;
 static uint8_t rx[65536], tx[65536];
 static size_t rx_size, tx_size;
+#ifdef SIM_DRIVER_HAL
+static size_t bytes_before_wake;
+#endif
 static unsigned dropped[256];
 static int runtime_error;
 static double pwm[4], resolutions[4], temperature = 25., currents[4];
@@ -129,6 +132,7 @@ void xSemaphoreGive(SemaphoreHandle_t handle) {
 }
 uint64_t hw_clock_microseconds(void) { return now_us; }
 
+#ifndef SIM_DRIVER_HAL
 static void motor_stop(motorIndex i) { pwm[i] = 0; motor_mode[i] = 0; }
 static uint32_t pwm_frequency = SIM_PWM_DEFAULT;
 uint32_t hw_motor_get_pwm_frequency(void) { return pwm_frequency; }
@@ -163,6 +167,9 @@ const hw_motor_interface_t *get_motor_interface(void) {
     static const hw_motor_interface_t value = {motor_init, motor_reversed, motor_initialized, motor_speed, motor_stop, motor_brake};
     return &value;
 }
+#else
+static void motor_stop(motorIndex i) { get_motor_interface()->stop(i); }
+#endif
 static void encoder_init(encoder_index_t i, double resolution, uint8_t reverse) {
     encoder_ready[i] = 1; resolutions[i] = resolution; encoder_reverse[i] = reverse;
 }
@@ -224,6 +231,7 @@ hw_current_sense_status_t hw_current_sense_read(uint8_t i, double *value) {
     *value = currents[i]; return HW_CURRENT_SENSE_OK;
 #endif
 }
+#ifndef SIM_DRIVER_HAL
 bool hw_drv8873_fault_active(motorIndex i) { return i >= 4 || faults[i].fault_active; }
 uint32_t hw_motor_fault_event_sequence(uint8_t i) { return i < 4 ? fault_sequence[i] : 0; }
 bool hw_motor_read_faults(uint8_t i, hw_motor_faults_t *value) {
@@ -250,12 +258,17 @@ bool hw_motor_set_current_limit(uint8_t i, const hw_motor_current_limit_t *value
     motor_stop(i); limits[i] = *value; return true;
 }
 
+#endif
+
 /* Wiring equivalent to the production command task's connection services,
  * with one native stream instead of USB + I2C queues. */
 static void stop_all(void) {
     platform_stop_velocity_controller();
     for (uint8_t i = 0; i < 4; ++i) { controllers_manager_stop_controller(i); motor_stop(i); }
     rx_size = 0;
+#ifdef SIM_DRIVER_HAL
+    bytes_before_wake = 0;
+#endif
 }
 static bool period_allowed(uint32_t period) { return connection_period_allowed(&session, period); }
 static uint32_t event_sequence(uint8_t topic, uint8_t i) {
@@ -268,7 +281,11 @@ static bool send_bytes(uint8_t *data, uint8_t length) {
 }
 API void sim_init(void) {
     if (!fram_loaded) { memset(fram, 0xff, sizeof(fram)); fram_loaded = true; }
+#ifdef SIM_DRIVER_HAL
+    hw_motor_init();
+#else
     for (unsigned i = 0; i < 4; ++i) faults[i].status_valid = true;
+#endif
 #ifdef SIM_CONFIGURATION_STORAGE
     controller_configuration_restore();
 #endif
@@ -300,7 +317,17 @@ API int sim_poll(uint64_t time_us) {
                 uint8_t request[255];
                 memcpy(request, rx + 1, size - 1);
                 rx_size -= size; memmove(rx, rx + size, rx_size);
+#ifdef SIM_DRIVER_HAL
+                // As in the firmware ingress queues, a frame whose first byte
+                // was buffered at wake remains marked through later fragments.
+                bool stale = bytes_before_wake != 0;
+                bytes_before_wake = bytes_before_wake > size ? bytes_before_wake - size : 0;
+                bool was_asleep = hw_motor_drivers_sleeping();
+                connection_receive_queued(&session, request, size - 1, stale);
+                if (was_asleep && !hw_motor_drivers_sleeping()) bytes_before_wake = rx_size;
+#else
                 connection_receive(&session, request, size - 1);
+#endif
             }
         }
         connection_poll(&session);
@@ -318,18 +345,32 @@ API uint64_t sim_deadline(void) {
         if (tasks[i].due < next) next = tasks[i].due;
     return next;
 }
-API void sim_disconnect(void) { connection_disconnect(&session); rx_size = tx_size = 0; }
+API void sim_disconnect(void) {
+    connection_disconnect(&session);
+    rx_size = tx_size = 0;
+#ifdef SIM_DRIVER_HAL
+    bytes_before_wake = 0;
+#endif
+}
 API int sim_lost(void) { return session.lost; }
 API int sim_ready(void) { return session.ready_announced; }
 API void sim_drop(uint8_t command, unsigned count) { dropped[command] = count; }
 API void sim_encoder(uint8_t index, uint16_t value) { if (index < 4) counts[index] = value; }
-API double sim_pwm(uint8_t i) { return i < 4 ? pwm[i] : 0; }
 API double sim_resolution(uint8_t i) { return i < 4 ? resolutions[i] : 0; }
+#ifndef SIM_DRIVER_HAL
+API double sim_pwm(uint8_t i) { return i < 4 ? pwm[i] : 0; }
 API int sim_reverse(uint8_t i) { return i < 4 ? motor_reverse[i] : 0; }
 API int sim_mode(uint8_t i) { return i < 4 ? motor_mode[i] : 0; }
+#endif
 API void sim_temperature(double value, int status) { temperature = value; temperature_status = status; }
 API void sim_imu(const double *values, int status) { memcpy(&imu, values, sizeof(imu)); imu_status = status; }
 API void sim_current(uint8_t i, double value, int status) { if (i < 4) { currents[i] = value; current_status[i] = status; } }
+#ifndef SIM_DRIVER_HAL
 API void sim_fault(uint8_t i, int active) {
     if (i < 4) { faults[i].fault_active = faults[i].overcurrent = active != 0; ++fault_sequence[i]; }
 }
+// Profiles with no physical sleep control always have an inactive latch.
+bool hw_motor_drivers_sleeping(void) { return false; }
+bool hw_motor_set_driver_sleep(bool sleeping) { (void)sleeping; return false; }
+API int sim_wake_readback_failure(uint8_t i, int active) { return 0; }
+#endif

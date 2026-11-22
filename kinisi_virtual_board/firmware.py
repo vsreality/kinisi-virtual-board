@@ -83,6 +83,7 @@ class FirmwareBoard:
             "imu": (None, (ct.POINTER(ct.c_double), ct.c_int)),
             "current": (None, (ct.c_uint8, ct.c_double, ct.c_int)),
             "fault": (None, (ct.c_uint8, ct.c_int)),
+            "wake_readback_failure": (ct.c_int, (ct.c_uint8, ct.c_int)),
             "fram_load": (ct.c_int, (ct.c_void_p, ct.c_size_t)),
             "fram_read": (ct.c_size_t, (ct.c_void_p, ct.c_size_t)),
             "fram_fault": (None, (ct.c_int64, ct.c_int)),
@@ -243,6 +244,14 @@ class FirmwareBoard:
         with self._lock:
             self._check_open()
             self._lib.sim_fault(index, active)
+
+    def set_wake_readback_failure(self, index, active=True):
+        """Corrupt the channel's IC4 readback after writes until cleared."""
+        self._index(index)
+        with self._lock:
+            self._check_open()
+            if not self._lib.sim_wake_readback_failure(index, active):
+                raise ValueError("Selected firmware has no simulated driver SPI interface")
 
     def disconnect(self):
         with self._lock:
