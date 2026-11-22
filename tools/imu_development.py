@@ -87,6 +87,10 @@ def export_recording(raw, out, case, course, preset, duration_ms):
         tail = next(references)
         if int(tail["at_us"]) != stamp + STEP_MS * 1000 or next(references, None) or next(sensors, None):
             raise ValueError("Unexpected recording length")
+        # The final delayed observation also needs an independent delivery-time reference.
+        if not all(math.isfinite(float(v)) for v in tail.values()):
+            raise ValueError("Nonfinite final delivery reference")
+        ref.writerow(tail)
     for cycle in range(6) if course != "stationary" else ():
         base = 2000 + cycle * 10_000
         forward, midway, reverse, stopped = [probes[base + offset] for offset in (2000, 4200, 6600, 9800)]
@@ -123,7 +127,7 @@ def main():
     settings = json.loads(baseline.CASES.read_bytes())
     spec = {key: settings[key] for key in ("revision", "presets", "encoder_counts_per_rev", "wheel_pid")}
     spec.update(step_ms=STEP_MS, surfaces={"nominal": []})
-    manifest = dict(development_only=True, simulator_revision=sim_revision,
+    manifest = dict(development_only=True, reserved_accessed=False, simulator_revision=sim_revision,
                     firmware_revision=fw_revision, schema_sha256=digest(fw / "commands.json"),
                     generator_sha256=digest(Path(__file__)), geometry_source_sha256=digest(baseline.CASES),
                     seeds=SEEDS, step_ms=STEP_MS, cases=[], invalid=[])
@@ -141,7 +145,8 @@ def main():
                         if not build.exists():
                             shutil.copyfile(raw.parent / build.name, build)
                         record = export_recording(raw, out, name, course, preset, duration_ms)
-                        manifest["cases"].append(dict(case=name, preset=preset, course=course, surface="nominal",
+                        manifest["cases"].append(dict(case=name, dataset_id="imu-development-v1/" + name,
+                                                      preset=preset, course=course, surface="nominal",
                                                       seed=seed, **record))
                     except Exception as exc:
                         invalid = out / "invalid" / name
