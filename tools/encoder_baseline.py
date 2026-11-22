@@ -132,6 +132,7 @@ def run_case(directory, firmware, spec, preset, mode, surface, seed):
         rates, readback = configure(wire, spec, preset, mode)
         board.advance(.6 - dt)
         previous_imu = imu.sample((0., 0., 9.80665), 0.)
+        previous_imu_us = board.now_us
         board.advance(dt)
         origin = board.now_us
         metadata = dict(preset=preset, mode=mode, surface=surface, seed=seed, origin_us=origin,
@@ -152,15 +153,16 @@ def run_case(directory, firmware, spec, preset, mode, surface, seed):
 
         def record():
             # Expose only delayed, biased, noisy and quantized sensor measurements to the board.
-            board.set_imu(previous_imu[:3], previous_imu[3:])
+            board.set_imu(previous_imu[:3], previous_imu[3:], accel_us=previous_imu_us, gyro_us=previous_imu_us)
             measured = struct.unpack("<6d", wire.ask("GET_IMU"))
-            obs.writerow([board.now_us, board.now_us - dt_ms * 1000, *board.encoder_counts, *measured])
+            obs.writerow([board.now_us, previous_imu_us, *board.encoder_counts, *measured])
             pose = struct.unpack("<QBB3d", wire.ask("GET_PLATFORM_ODOMETRY"))
             est.writerow([board.now_us, *pose, board.controller_dispatches, *board.motor_pwm])
             truth.writerow([board.now_us, *chassis.pose, *chassis.twist])
 
         record()
         previous_imu = imu.sample((0., 0., 9.80665), 0.)  # Newly acquired at the origin.
+        previous_imu_us = origin
         for elapsed in range(0, recipe["duration_ms"], dt_ms):
             if elapsed in events:
                 x, y, yaw = events[elapsed]
@@ -177,6 +179,7 @@ def run_case(directory, firmware, spec, preset, mode, surface, seed):
             acquired = imu.sample(specific_force, chassis.twist[2])
             record()
             previous_imu = acquired
+            previous_imu_us = board.now_us
         if board.now_us != origin + recipe["duration_ms"] * 1000:
             raise ValueError("Incomplete simulated duration")
 

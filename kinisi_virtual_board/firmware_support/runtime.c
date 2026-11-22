@@ -63,6 +63,7 @@ static uint16_t counts[4];
 static uint8_t motor_ready[4], motor_reverse[4], motor_mode[4];
 static uint8_t encoder_ready[4], encoder_reverse[4], pins[10], led;
 static hw_imu_sample_t imu = {.acceleration_z = 9.80665};
+static uint64_t imu_accel_us, imu_gyro_us;
 static hw_motor_faults_t faults[4];
 static uint32_t fault_sequence[4];
 static hw_motor_current_limit_t limits[4];
@@ -238,7 +239,7 @@ hw_temperature_status_t hw_temperature_read(uint8_t i, double *value) {
     *value = temperature; return HW_TEMPERATURE_OK;
 #endif
 }
-hw_imu_status_t hw_imu_read(uint8_t i, hw_imu_sample_t *value) {
+static hw_imu_status_t imu_read_status(uint8_t i) {
     ++imu_reads;
 #if NUMBER_IMU_SENSORS == 0
     return HW_IMU_UNAVAILABLE;
@@ -246,8 +247,24 @@ hw_imu_status_t hw_imu_read(uint8_t i, hw_imu_sample_t *value) {
     if (i >= NUMBER_IMU_SENSORS) return HW_IMU_UNAVAILABLE;
     if (imu_status) return (hw_imu_status_t)imu_status;
     if (now_us < 50000) return HW_IMU_NOT_READY;
-    *value = imu; return HW_IMU_OK;
+    return HW_IMU_OK;
 #endif
+}
+hw_imu_status_t hw_imu_read(uint8_t i, hw_imu_sample_t *value) {
+    hw_imu_status_t status = imu_read_status(i);
+    if (status == HW_IMU_OK) *value = imu;
+    return status;
+}
+API hw_imu_status_t hw_imu_read_observation(uint8_t index, hw_imu_sample_t *sample,
+                                           uint64_t *accel_us, uint64_t *gyro_us) {
+    hw_imu_status_t status = imu_read_status(index);
+    if (status != HW_IMU_OK) return status;
+    if (!sample || !accel_us || !gyro_us) return HW_IMU_IO_ERROR;
+    if (!imu_accel_us || !imu_gyro_us) return HW_IMU_NOT_READY;
+    *sample = imu;
+    *accel_us = imu_accel_us;
+    *gyro_us = imu_gyro_us;
+    return HW_IMU_OK;
 }
 hw_current_sense_status_t hw_current_sense_read(uint8_t i, double *value) {
 #if NUMBER_CURRENT_SENSORS == 0
@@ -433,7 +450,15 @@ API int sim_reverse(uint8_t i) { return i < 4 ? motor_reverse[i] : 0; }
 API int sim_mode(uint8_t i) { return i < 4 ? motor_mode[i] : 0; }
 #endif
 API void sim_temperature(double value, int status) { temperature = value; temperature_status = status; }
-API void sim_imu(const double *values, int status) { memcpy(&imu, values, sizeof(imu)); imu_status = status; }
+API void sim_imu_observation(const double *values, int status, uint64_t accel_us, uint64_t gyro_us) {
+    memcpy(&imu, values, sizeof(imu));
+    imu_status = status;
+    imu_accel_us = accel_us;
+    imu_gyro_us = gyro_us;
+}
+API void sim_imu(const double *values, int status) {
+    sim_imu_observation(values, status, now_us, now_us);
+}
 API void sim_current(uint8_t i, double value, int status) { if (i < 4) { currents[i] = value; current_status[i] = status; } }
 #ifndef SIM_DRIVER_HAL
 API void sim_fault(uint8_t i, int active) {

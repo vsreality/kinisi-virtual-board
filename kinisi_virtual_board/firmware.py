@@ -82,7 +82,7 @@ class FirmwareBoard:
             "pwm": (ct.c_double, (ct.c_uint8,)), "resolution": (ct.c_double, (ct.c_uint8,)),
             "reverse": (ct.c_int, (ct.c_uint8,)), "mode": (ct.c_int, (ct.c_uint8,)),
             "temperature": (None, (ct.c_double, ct.c_int)),
-            "imu": (None, (ct.POINTER(ct.c_double), ct.c_int)),
+            "imu_observation": (None, (ct.POINTER(ct.c_double), ct.c_int, ct.c_uint64, ct.c_uint64)),
             "current": (None, (ct.c_uint8, ct.c_double, ct.c_int)),
             "fault": (None, (ct.c_uint8, ct.c_int)),
             "sleep_readback_failure": (ct.c_int, (ct.c_uint8, ct.c_int)),
@@ -335,12 +335,19 @@ class FirmwareBoard:
             self._check_open()
             self._lib.sim_temperature(celsius, status)
 
-    def set_imu(self, acceleration=(0., 0., 9.80665), angular_velocity=(0., 0., 0.), *, status=0):
+    def set_imu(self, acceleration=(0., 0., 9.80665), angular_velocity=(0., 0., 0.), *,
+                status=0, accel_us=None, gyro_us=None):
+        """Deliver one observation. Omitted acquisition times use the current board clock."""
         if len(acceleration) != 3 or len(angular_velocity) != 3:
             raise ValueError("IMU vectors must have three components")
+        for stamp in (accel_us, gyro_us):
+            if stamp is not None and (type(stamp) is not int or not 0 <= stamp < 2**64):
+                raise ValueError("IMU acquisition times must be unsigned 64-bit microseconds")
         with self._lock:
             self._check_open()
-            self._lib.sim_imu((ct.c_double * 6)(*acceleration, *angular_velocity), status)
+            self._lib.sim_imu_observation((ct.c_double * 6)(*acceleration, *angular_velocity), status,
+                                          self.now_us if accel_us is None else accel_us,
+                                          self.now_us if gyro_us is None else gyro_us)
 
     def set_current(self, index, amperes=0., *, status=0):
         self._index(index)

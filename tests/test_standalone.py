@@ -11,6 +11,7 @@ import unittest
 
 from kinisi_virtual_board import FirmwareBoard, Schema
 from test_board import COMMANDS, frames
+from test_firmware import FIRMWARE
 from test_native import NativeSDKMixin
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -69,7 +70,7 @@ class StandaloneTests(unittest.TestCase):
 
     def test_cpp_and_python_plants_match_real_firmware(self):
         for reverse in (False, True):
-            with self.subTest(reverse=reverse), FirmwareBoard(COMMANDS) as board:
+            with self.subTest(reverse=reverse), FirmwareBoard(COMMANDS, firmware=FIRMWARE) as board:
                 operations = self.motor_operations(reverse)
                 operations += [('F', self.request('SET_MOTOR_TARGET_SPEED', speed=2)),
                                ('A', struct.pack('<Q', 10000)),

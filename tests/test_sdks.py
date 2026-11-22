@@ -15,6 +15,7 @@ from unittest.mock import patch
 
 from kinisi_virtual_board import TCPServer, VirtualBoard, FirmwareBoard, VirtualSerial
 from test_board import COMMANDS
+from test_firmware import FIRMWARE
 
 WORKSPACE = Path(__file__).resolve().parents[2]
 PYSDK = Path(os.environ.get("KINISI_PYSDK", WORKSPACE / "pykinisi"))
@@ -115,7 +116,7 @@ class PythonSDKTests(unittest.TestCase):
 
     def test_python_sdk_over_real_tcp(self):
         import serial
-        with TCPServer(("127.0.0.1", 0), lambda: FirmwareBoard(COMMANDS)) as server:
+        with TCPServer(("127.0.0.1", 0), lambda: FirmwareBoard(COMMANDS, firmware=FIRMWARE)) as server:
             worker = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": .01})
             worker.start()
             try:
@@ -143,7 +144,7 @@ class JavaScriptSDKTests(unittest.TestCase):
         node = shutil.which("node")
         if not node or not (JSSDK / "src/commands/kinisi_session.js").is_file():
             missing("Node and KINISI_JSSDK checkout are required")
-        with TCPServer(("127.0.0.1", 0), lambda: FirmwareBoard(COMMANDS)) as server:
+        with TCPServer(("127.0.0.1", 0), lambda: FirmwareBoard(COMMANDS, firmware=FIRMWARE)) as server:
             worker = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": .01})
             worker.start()
             try:
