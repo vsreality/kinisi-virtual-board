@@ -130,10 +130,15 @@ class DriverSleepTests(unittest.TestCase):
                 session.ok("SET_MOTOR_SPEED", motor_index=0, pwm=25)
                 self.assertEqual(board.motor_pwm[0], 25.)
 
-    def test_v03_reports_unsupported_and_preserves_pwm(self):
+    def test_v03_capability_matches_selected_firmware(self):
         board, session = self.board("0.3.0")
         session.ok("INITIALIZE_MOTOR", motor_index=0)
         session.ok("SET_MOTOR_SPEED", motor_index=0, pwm=15)
+        if board.has_drv8870:
+            self.sleep(session, 1)
+            self.assert_latch(session, 1)
+            self.assert_stopped(board)
+            return
         self.sleep(session, 1, "SENSOR_NOT_AVAILABLE")
         session.error("GET_DRIVER_SLEEP", "SENSOR_NOT_AVAILABLE")
         self.assertEqual(board.motor_pwm, (15., 0., 0., 0.))

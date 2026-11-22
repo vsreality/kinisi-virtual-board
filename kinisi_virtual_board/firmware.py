@@ -91,6 +91,18 @@ class FirmwareBoard:
             "temperature_reads": (ct.c_uint64, ()), "imu_reads": (ct.c_uint64, ()),
             "fram_reads": (ct.c_uint32, ()), "fram_writes": (ct.c_uint32, ()),
         }
+        self.has_drv8870 = hasattr(self._lib, "sim_pad")
+        if self.has_drv8870:
+            signatures.update({
+                "usb_busy": (None, (ct.c_int,)),
+                "timer_ticks": (ct.c_int, (ct.c_uint, ct.c_uint)),
+                "pad_af": (ct.c_int, (ct.c_uint, ct.c_uint)),
+                "pad": (ct.c_int, (ct.c_uint, ct.c_uint, ct.POINTER(ct.c_int))),
+                "low_dwell_ms": (ct.c_uint64, ()),
+                "i2c_write": (ct.c_int, (ct.c_void_p, ct.c_size_t, ct.c_int)),
+                "i2c_begin_read": (None, ()),
+                "i2c_end_read": (ct.c_size_t, (ct.c_void_p, ct.c_size_t)),
+            })
         for name, (result, arguments) in signatures.items():
             function = getattr(self._lib, "sim_" + name)
             function.restype, function.argtypes = result, arguments
@@ -167,6 +179,74 @@ class FirmwareBoard:
         with self._lock:
             self._check_open()
             return tuple(self._lib.sim_pwm(i) for i in range(4))
+
+    def _check_drv8870(self):
+        self._check_open()
+        if not self.has_drv8870:
+            raise ValueError("This observation requires a native DRV8870 sleep profile")
+
+    def input_pad(self, bank, bit):
+        """Return (source, high ticks per 840) for a motor input, or (None, None)."""
+        if bank not in ("A", "B", "C", "D", "E") or not isinstance(bit, int) or not 0 <= bit < 16:
+            raise ValueError("Expected GPIO bank A..E and bit 0..15")
+        with self._lock:
+            self._check_drv8870()
+            ticks = ct.c_int()
+            source = self._lib.sim_pad(ord(bank) - ord("A"), bit, ct.byref(ticks))
+            if source < 0:
+                return None, None
+            return ("timer" if source else "gpio"), ticks.value
+
+    def timer_ticks(self, timer, channel):
+        """Raw compare on a started regular channel, or -1 if it has not started."""
+        if timer not in range(1, 13) or channel not in range(1, 5):
+            raise ValueError("Expected TIM1..12, channel 1..4")
+        with self._lock:
+            self._check_drv8870()
+            return self._lib.sim_timer_ticks(timer, channel)
+
+    def pad_alternate_function(self, bank, bit):
+        """Alternate function selected by HAL_GPIO_Init, or -1 in GPIO mode."""
+        if bank not in ("A", "B", "C", "D", "E") or bit not in range(16):
+            raise ValueError("Expected GPIO bank A..E and bit 0..15")
+        with self._lock:
+            self._check_drv8870()
+            return self._lib.sim_pad_af(ord(bank) - ord("A"), bit)
+
+    @property
+    def low_dwell_ms(self):
+        """Total HAL delay requested while all eight pads were GPIO outputs reading low."""
+        with self._lock:
+            self._check_drv8870()
+            return self._lib.sim_low_dwell_ms()
+
+    def set_usb_busy(self, busy):
+        """Hold USB replies pending to model an occupied CDC transmit endpoint."""
+        with self._lock:
+            self._check_drv8870()
+            self._lib.sim_usb_busy(bool(busy))
+            self._poll()
+
+    def i2c_write(self, data, *, start=True):
+        """Start a master write, or continue the same transaction with start=False."""
+        data = bytes(data)
+        with self._lock:
+            self._check_drv8870()
+            if not self._lib.sim_i2c_write(data, len(data), start):
+                raise ValueError("I2C write exceeds the active length-prefixed transaction")
+            self._poll()
+
+    def i2c_read(self, size=256):
+        """One fixed-size master read. An empty result means no reply was ready."""
+        if type(size) is not int or not 1 <= size <= 256:
+            raise ValueError("I2C master read size must be 1..256")
+        with self._lock:
+            self._check_drv8870()
+            buffer = ct.create_string_buffer(size)
+            self._lib.sim_i2c_begin_read()
+            self._poll()
+            length = self._lib.sim_i2c_end_read(buffer, size)
+            return buffer.raw[:length]
 
     def feed(self, data):
         data = bytes(data)
@@ -255,7 +335,7 @@ class FirmwareBoard:
             self._lib.sim_fault(index, active)
 
     def set_sleep_readback_failure(self, index, active=True):
-        """Force the selected channel's nSLEEP readback high until cleared."""
+        """Force nSLEEP (DRV8873) or IN1 (DRV8870) readback high until cleared."""
         self._index(index)
         with self._lock:
             self._check_open()

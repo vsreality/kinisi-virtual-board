@@ -15,7 +15,7 @@ def main():
     parser.add_argument("--compiler", help="Host GCC/Clang executable; defaults to CC or auto-detection")
     parser.add_argument("--commands", type=Path, help="Shared commands.json; defaults to --firmware/commands.json")
     parser.add_argument("--board-profile", type=Path, help="Optional firmware boards/v0.x.json")
-    parser.add_argument("--revision", default="0.4.0", choices=["0.3.0", "0.4.0"])
+    parser.add_argument("--revision", default="0.4.0", choices=["0.3.0", "0.3.1", "0.4.0"])
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8766, help="0 chooses an available port")
     transport = parser.add_mutually_exclusive_group()

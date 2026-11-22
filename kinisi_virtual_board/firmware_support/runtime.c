@@ -36,9 +36,14 @@ _Static_assert(sizeof(double) == 8, "Kinisi wire format requires 64-bit doubles"
 #endif
 
 static uint64_t now_us;
+static uint8_t tx[65536];
+static size_t tx_size;
+#ifdef SIM_DUAL_TRANSPORT
+#include "dual_transport.h"
+#else
 static connection_t session;
-static uint8_t rx[65536], tx[65536];
-static size_t rx_size, tx_size;
+static uint8_t rx[65536];
+static size_t rx_size;
 #ifdef SIM_DRIVER_HAL
 static size_t bytes_before_wake;
 static bool consume_mark(size_t *marked, size_t frame_size) {
@@ -48,6 +53,7 @@ static bool consume_mark(size_t *marked, size_t frame_size) {
 }
 #if BOARD_HAS_BOARD_IDLE
 static size_t bytes_before_board_wake;
+#endif
 #endif
 #endif
 static unsigned dropped[256];
@@ -179,7 +185,9 @@ const hw_motor_interface_t *get_motor_interface(void) {
     return &value;
 }
 #else
+#ifndef SIM_DUAL_TRANSPORT
 static void motor_stop(motorIndex i) { get_motor_interface()->stop(i); }
+#endif
 #endif
 static void encoder_init(encoder_index_t i, double resolution, uint8_t reverse) {
     encoder_ready[i] = 1; resolutions[i] = resolution; encoder_reverse[i] = reverse;
@@ -278,6 +286,7 @@ bool hw_motor_set_current_limit(uint8_t i, const hw_motor_current_limit_t *value
 
 /* Wiring equivalent to the production command task's connection services,
  * with one native stream instead of USB + I2C queues. */
+#ifndef SIM_DUAL_TRANSPORT
 static void stop_all(void) {
     platform_stop_velocity_controller();
     for (uint8_t i = 0; i < 4; ++i) { controllers_manager_stop_controller(i); motor_stop(i); }
@@ -293,7 +302,8 @@ static bool period_allowed(uint32_t period) { return connection_period_allowed(&
 static uint32_t event_sequence(uint8_t topic, uint8_t i) {
     return topic == TOPIC_MOTOR_FAULTS ? hw_motor_fault_event_sequence(i) : 0;
 }
-static bool send_bytes(uint8_t *data, uint8_t length) {
+#endif
+bool sim_usb_send(uint8_t *data, uint8_t length) {
     if (dropped[data[1]] && (data[2] || data[3])) { --dropped[data[1]]; return true; }
     if (tx_size + length > sizeof(tx)) return false;
     memcpy(tx + tx_size, data, length); tx_size += length; return true;
@@ -308,12 +318,20 @@ API void sim_init(void) {
 #ifdef SIM_CONFIGURATION_STORAGE
     controller_configuration_restore();
 #endif
-    connection_init(&session, command_handler, send_bytes, hw_clock_microseconds);
+#ifdef SIM_DUAL_TRANSPORT
+    sim_transport_init();
+#else
+    connection_init(&session, command_handler, sim_usb_send, hw_clock_microseconds);
     session.services = (connection_services_t){stop_all, odometry_manager_get_period_ms, period_allowed, event_sequence};
+#endif
 }
 API int sim_feed(const uint8_t *data, size_t length) {
+#ifdef SIM_DUAL_TRANSPORT
+    return sim_usb_feed(data, length);
+#else
     if (length > sizeof(rx) - rx_size) return 0;
     memcpy(rx + rx_size, data, length); rx_size += length; return 1;
+#endif
 }
 static void run_tasks(void) {
     for (volatile unsigned i = 0; i < task_count; ++i) {
@@ -326,6 +344,11 @@ static void run_tasks(void) {
 API int sim_poll(uint64_t time_us) {
     if (time_us < now_us) return 6;
     now_us = time_us;
+#ifdef SIM_DUAL_TRANSPORT
+    sim_transport_expire();
+    run_tasks();
+    for (unsigned turn = 0; turn < 64; ++turn) sim_transport_step();
+#else
     /* Expire the watchdog before either controller updates or queued commands. */
     connection_poll(&session);
     run_tasks();
@@ -360,6 +383,7 @@ API int sim_poll(uint64_t time_us) {
         }
         connection_poll(&session);
     }
+#endif
     run_tasks(); /* Prime tasks created by this batch of commands at this time. */
     return runtime_error;
 }
@@ -374,6 +398,10 @@ API uint64_t sim_deadline(void) {
     return next;
 }
 API void sim_disconnect(void) {
+#ifdef SIM_DUAL_TRANSPORT
+    sim_usb_disconnect();
+    tx_size = 0;
+#else
     connection_disconnect(&session);
     rx_size = tx_size = 0;
 #ifdef SIM_DRIVER_HAL
@@ -382,9 +410,15 @@ API void sim_disconnect(void) {
     bytes_before_board_wake = 0;
 #endif
 #endif
+#endif
 }
+#ifdef SIM_DUAL_TRANSPORT
+API int sim_lost(void) { return sim_usb_lost(); }
+API int sim_ready(void) { return sim_usb_ready(); }
+#else
 API int sim_lost(void) { return session.lost; }
 API int sim_ready(void) { return session.ready_announced; }
+#endif
 API void sim_drop(uint8_t command, unsigned count) { dropped[command] = count; }
 API void sim_encoder(uint8_t index, uint16_t value) { if (index < 4) counts[index] = value; }
 API double sim_resolution(uint8_t i) { return i < 4 ? resolutions[i] : 0; }

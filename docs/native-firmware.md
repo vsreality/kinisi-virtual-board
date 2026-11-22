@@ -234,3 +234,28 @@ protocol 2.15 firmware. In the Python harness,
 `board.set_wake_readback_failure(2)` corrupts channel 2's current-limit register
 on write. Pass `False` as the second argument to allow verified writes again.
 The injection applies during initialization as well as wake.
+
+## DRV8870 sleep on original v0.3 and Nano
+
+With protocol 2.17 firmware, select `--revision 0.3.0` for the original board or
+`--revision 0.3.1` for Nano. Both execute the firmware motor driver. The 0.3.0
+build uses PA9/TIM1_CH2 for M3 IN2. Nano uses PA10/TIM1_CH3 and reserves PA9
+for USB sensing. The native host supplies USB attachment explicitly.
+
+`FirmwareBoard.feed()` feeds the firmware USB command queue. On these profiles,
+`i2c_write(frame)` starts a transaction on the same board. To pause after a
+prefix, write the first bytes and then call `i2c_write(tail, start=False)`.
+Each `i2c_read()` requests one padded 256-byte reply through the firmware slave
+callbacks. An empty result means the simulated master received no frame.
+`set_usb_busy(True)` holds USB replies to exercise pending requests while the
+other session runs. The C++ serial endpoint uses the USB command session.
+
+`input_pad("A", 10)` returns the output source and high ticks per 840-count
+period, or `(None, None)` for an undriven or unmapped motor input.
+`timer_ticks(1, 3)` reads a regular timer compare and
+`pad_alternate_function("A", 10)` reports the selected pin mux.
+`low_dwell_ms` counts requested HAL delay while every motor input is a GPIO
+output reading low. After explicit release, a fresh brake produces high/high on
+the addressed channels. Ordinary coast produces low/low and permits immediate
+drive. These observations describe settled simulated outputs. Oscilloscope
+waveforms, transient timing, first-drive latency and current draw require hardware.

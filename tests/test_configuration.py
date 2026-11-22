@@ -207,12 +207,12 @@ class ConfigurationTests(unittest.TestCase):
         image, _ = self.saved()
         board, session = self.board(revision="0.3.0", fram_image=image)
         session.ok("INITIALIZE_MOTOR", motor_index=0)
-        session.ok("SET_MOTOR_SPEED", motor_index=0, pwm=12)
+        session.ok("SET_MOTOR_SPEED", motor_index=0, pwm=25)
         session.error("SAVE_CONFIGURATION", "SENSOR_NOT_AVAILABLE")
         session.error("GET_CONFIGURATION_FIELD", "SENSOR_NOT_AVAILABLE", field=0)
         self.assertEqual(board.fram_image, image)
         self.assertEqual(board.fram_transactions, (0, 0))
-        self.assertEqual(board.motor_pwm, (12., 0., 0., 0.))
+        self.assertEqual(board.motor_pwm, (25., 0., 0., 0.))
 
     def test_saved_image_survives_separate_process_boot(self):
         with tempfile.TemporaryDirectory(prefix="kinisi-fram-test-") as directory:
