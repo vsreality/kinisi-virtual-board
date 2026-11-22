@@ -316,7 +316,9 @@ class BoardTests(unittest.TestCase):
         expected += [name for name in ("GET_PWM_FREQUENCY", "SET_PWM_FREQUENCY",
                                       "SAVE_CONFIGURATION", "GET_CONFIGURATION_FIELD", "SET_DRIVER_SLEEP", "GET_DRIVER_SLEEP",
                                       "SET_BOARD_IDLE", "GET_BOARD_IDLE", "SET_FUSION_EXPERIMENT",
-                                      "GET_FUSION_STATUS", "GET_FUSION_VECTOR", "GET_FUSION_CONFIGURATION")
+                                      "GET_FUSION_STATUS", "GET_FUSION_VECTOR", "GET_FUSION_CONFIGURATION",
+                                      "SET_IMU_TRACKING", "GET_IMU_TRACKING_STATUS", "GET_IMU_TRACKING_VECTOR",
+                                      "GET_IMU_TRACKING_CONFIGURATION")
                      if name in self.board.schema.commands]
         self.assertEqual(self.board.unsupported_commands, sorted(expected))
 
