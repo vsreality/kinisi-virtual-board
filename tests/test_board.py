@@ -234,13 +234,89 @@ class BoardTests(unittest.TestCase):
         self.error("GET_TEMPERATURE", "SAMPLE_NOT_AVAILABLE")
         self.board.advance(.3)
         self.assertEqual(struct.unpack("<d", self.ok("GET_TEMPERATURE"))[0], 25.)
-        self.assertEqual(struct.unpack("<6d", self.ok("GET_IMU"))[2], 9.80665)
+        imu = struct.unpack("<6d", self.ok("GET_IMU"))
+        self.assertAlmostEqual(imu[2], 9.80665, delta=.5)
+        self.assertEqual(imu, tuple(self.board.imu_model.values))
         self.error("GET_IMU", "SENSOR_NOT_AVAILABLE", sensor_index=1)
         self.board.sensor_errors["temperature", 0] = "INTERNAL_ERROR"
         self.error("GET_TEMPERATURE", "INTERNAL_ERROR")
         self.board = VirtualBoard(COMMANDS, revision="0.3.0")
         self.initialize()
         self.error("GET_TEMPERATURE", "SENSOR_NOT_AVAILABLE")
+
+    def test_default_bmi088_is_seeded_and_changes_at_rest(self):
+        self.initialize()
+        twin = VirtualBoard(COMMANDS, imu_seed=1)
+        other = VirtualBoard(COMMANDS, imu_seed=2)
+        readings = []
+        for _ in range(8):
+            self.board.advance(.05)
+            twin.advance(.05)
+            other.advance(.05)
+            values = struct.unpack("<6d", self.ok("GET_IMU"))
+            readings.append(values)
+            self.assertEqual(values, tuple(twin.imu.values()))
+            self.assertNotEqual(values, tuple(other.imu.values()))
+        self.assertGreater(len(set(readings)), 1)
+        self.assertTrue(all(abs(v[2]-9.80665) < .5 for v in readings))
+        self.assertIsNone(VirtualBoard(COMMANDS, revision="0.3.0").imu_model)
+
+    def test_bmi088_uses_planar_body_rotation(self):
+        self.initialize()
+        self.board.velocity = [0., 0., .5]
+        self.board.advance(.3)
+        values = struct.unpack("<6d", self.ok("GET_IMU"))
+        self.assertAlmostEqual(values[5], .5, delta=.05)
+        self.assertAlmostEqual(values[2], 9.80665, delta=.5)
+
+    def test_bmi088_watchdog_stop_preserves_sensor_step_cadence(self):
+        one = VirtualBoard(COMMANDS)
+        many = VirtualBoard(COMMANDS)
+        for board in (one, many):
+            board.velocity = [.5, 0., 0.]
+            board.heartbeat_enabled = True
+            board.heartbeat_timeout_ms = 100
+        one.advance(.5)
+        for _ in range(50):
+            many.advance(.01)
+        self.assertTrue(one.lost and many.lost)
+        self.assertEqual(one.velocity, [0., 0., 0.])
+        self.assertEqual(one.imu, many.imu)
+        self.assertEqual(one.imu_model.accel_us, many.imu_model.accel_us)
+        self.assertEqual(one.imu_model.gyro_us, many.imu_model.gyro_us)
+
+    def test_bmi088_temperature_is_separate_from_temperature_sensor_fixture(self):
+        hot = VirtualBoard(COMMANDS, temperature_c=85.)
+        nominal = VirtualBoard(COMMANDS, temperature_c=25.)
+        self.assertEqual(hot.temperature, 25.)
+        self.assertNotEqual(hot.imu_model.bias, nominal.imu_model.bias)
+        hot.temperature = 41.25
+        bias = tuple(hot.imu_model.bias)
+        hot.advance(.1)
+        self.assertEqual(tuple(hot.imu_model.bias), bias)
+        with self.assertRaises(ValueError):
+            VirtualBoard(COMMANDS, temperature_c=86.)
+
+    def test_explicit_imu_injection_and_mutable_dictionary_are_preserved(self):
+        self.initialize()
+        self.board.set_imu((1, 2, 3), (4, 5, 6))
+        self.board.advance(.3)
+        self.assertEqual(struct.unpack("<6d", self.ok("GET_IMU")), (1, 2, 3, 4, 5, 6))
+        self.board = VirtualBoard(COMMANDS)
+        self.initialize()
+        self.board.imu["acceleration_x"] = 2.5
+        expected = tuple(self.board.imu.values())
+        self.board.advance(.3)
+        self.assertEqual(struct.unpack("<6d", self.ok("GET_IMU")), expected)
+        self.board = VirtualBoard(COMMANDS)
+        self.initialize()
+        self.board.imu = dict(self.board.imu)
+        self.board.advance(.3)
+        self.assertEqual(struct.unpack("<6d", self.ok("GET_IMU")), (0., 0., 9.80665, 0., 0., 0.))
+        with self.assertRaises(ValueError):
+            self.board.set_imu((1, 2), (3, 4, 5))
+        with self.assertRaises(ValueError):
+            self.board.set_imu((float("nan"), 0, 0))
 
     def test_topic_subscription_and_unsubscribe(self):
         self.initialize()

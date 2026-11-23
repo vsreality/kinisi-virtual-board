@@ -35,8 +35,9 @@ class ChassisTests(unittest.TestCase):
                     self.assertAlmostEqual(chassis.twist[other], 0.)
 
     def test_imu_mount_sign_and_determinism(self):
-        a = VirtualIMU(123).sample((2., -1., 9.80665), .5)
-        b = VirtualIMU(123).sample((2., -1., 9.80665), .5)
+        units = [VirtualIMU(123), VirtualIMU(123)]
+        for _ in range(10):
+            a, b = [u.sample((2., -1., 9.80665), .5) for u in units]
         self.assertEqual(a, b)
-        for actual, expected in zip(a, (-2., 1., 9.80665, 0., 0., .5)):
-            self.assertAlmostEqual(actual, expected, delta=.15)
+        for actual, expected, offset in zip(a, (-2., 1., 9.80665, 0., 0., .5), units[0].bias):
+            self.assertAlmostEqual(actual, expected + offset, delta=.05)

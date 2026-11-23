@@ -92,6 +92,28 @@ class StandaloneTests(unittest.TestCase):
         position = struct.unpack('<d', frames(self.run_operations(operations)[-1])[0][2])[0]
         self.assertAlmostEqual(position, 1, delta=.015)
 
+    def test_bmi088_responds_to_actual_platform_motion(self):
+        operations = [self.init(),
+            ('F', self.request('INITIALIZE_DIFFERENTIAL_PLATFORM', wheel_diameter=.1,
+                               wheel_base=.3, encoder_resolution=10000)),
+            ('A', struct.pack('<Q', 100000)), ('F', self.request('GET_IMU')),
+            ('F', self.request('SET_PLATFORM_VELOCITY', x=30., y=0., t=0.)),
+            ('A', struct.pack('<Q', 50000)), ('F', self.request('GET_IMU')),
+            ('F', self.request('SET_PLATFORM_VELOCITY', x=0., y=0., t=30.)),
+            ('A', struct.pack('<Q', 500000)), ('F', self.request('GET_IMU'))]
+        results = self.run_operations(operations)
+        stationary, accelerating, rotating = [struct.unpack('<6d', frames(results[i])[0][2]) for i in (3, 6, 9)]
+        self.assertLess(accelerating[0] - stationary[0], -.5)  # Native X points opposite body X.
+        self.assertGreater(abs(rotating[5] - stationary[5]), .5)
+        # Both host implementations deliver the same actual-shaft source to C.
+        with FirmwareBoard(firmware=FIRMWARE) as board:
+            expected = []
+            for op, payload in operations:
+                if op == 'F': board.feed(payload)
+                else: board.advance(struct.unpack('<Q', payload)[0] / 1e6)
+                expected.append(board.drain())
+        self.assertEqual(results, expected)
+
     def test_watchdog_and_disconnect_require_new_session(self):
         for expire in (True, False):
             operations = self.motor_operations() + [('F', self.request('SET_HEARTBEAT_CONFIG', enabled=1, timeout_ms=100))]

@@ -31,17 +31,24 @@ class FirmwareBoard:
     16-bit encoder counts to the production controller/odometry tasks. This runs
     the firmware's C application, not the STM32 binary, HAL or real RTOS.
     Instances own independent shared libraries and must be closed after use.
+    The BMI088 uses imu_seed and temperature_c for a reproducible sensor unit.
+    Configured platforms assume no-slip wheels attached to their motor shafts;
+    without a platform it models a stationary bench. set_imu selects exact input.
     """
     FRAM_SIZE = 8192
 
     def __init__(self, commands=None, *, firmware=DEFAULT_FIRMWARE, revision="0.4.0",
                  compiler=None, max_speed=10.0, time_constant=0.05, encoder_motors=(0, 1, 2, 3),
-                 fram_image=None, fram_read_failure=False):
+                 fram_image=None, fram_read_failure=False, imu_seed=1, temperature_c=25.0):
         self.schema = commands if isinstance(commands, Schema) else Schema(commands or Path(firmware) / "commands.json")
         if not math.isfinite(max_speed) or max_speed <= 0 or not math.isfinite(time_constant) or time_constant <= 0:
             raise ValueError("Plant max_speed and time_constant must be finite and positive")
         if len(encoder_motors) != 4 or any(type(i) is not int or not 0 <= i < 4 for i in encoder_motors):
             raise ValueError("encoder_motors must map each of the four encoders to a motor index")
+        if type(imu_seed) is not int or not 0 <= imu_seed < 2**32:
+            raise ValueError("imu_seed must be an unsigned 32-bit integer")
+        if not math.isfinite(temperature_c) or not -40 <= temperature_c <= 85:
+            raise ValueError("BMI088 operating temperature must be -40 to 85 C")
         if fram_image is not None:
             fram_image = bytes(fram_image)
             if len(fram_image) != self.FRAM_SIZE:
@@ -79,9 +86,11 @@ class FirmwareBoard:
             "drop": (None, (ct.c_uint8, ct.c_uint)), "encoder": (None, (ct.c_uint8, ct.c_uint16)),
             "controller_dispatches": (ct.c_uint64, ()),
             "encoder_count": (ct.c_uint16, (ct.c_uint8,)),
+            "shaft_velocity": (None, (ct.POINTER(ct.c_double),)),
             "pwm": (ct.c_double, (ct.c_uint8,)), "resolution": (ct.c_double, (ct.c_uint8,)),
             "reverse": (ct.c_int, (ct.c_uint8,)), "mode": (ct.c_int, (ct.c_uint8,)),
             "temperature": (None, (ct.c_double, ct.c_int)),
+            "imu_configure": (ct.c_int, (ct.c_uint32, ct.c_double)),
             "imu_observation": (None, (ct.POINTER(ct.c_double), ct.c_int, ct.c_uint64, ct.c_uint64)),
             "current": (None, (ct.c_uint8, ct.c_double, ct.c_int)),
             "fault": (None, (ct.c_uint8, ct.c_int)),
@@ -112,6 +121,9 @@ class FirmwareBoard:
         if fram_image is not None:
             self._lib.sim_fram_load(fram_image, len(fram_image))
         self._lib.sim_fram_fault(-1, bool(fram_read_failure))
+        if not self._lib.sim_imu_configure(imu_seed, temperature_c):
+            self.close()
+            raise ValueError("Unable to configure native IMU before startup")
         self._lib.sim_init()
 
     @property
@@ -319,6 +331,7 @@ class FirmwareBoard:
                 for encoder, motor in enumerate(self.encoder_motors):
                     self._counts[encoder] += delta[motor] * self._lib.sim_resolution(encoder) / math.tau
                     self._lib.sim_encoder(encoder, int(self._counts[encoder]) & 0xffff)
+                self._lib.sim_shaft_velocity((ct.c_double * 4)(*self.motor_velocity))
                 self.now_us += step
                 self._poll()
             self._poll()
@@ -337,7 +350,12 @@ class FirmwareBoard:
 
     def set_imu(self, acceleration=(0., 0., 9.80665), angular_velocity=(0., 0., 0.), *,
                 status=0, accel_us=None, gyro_us=None):
-        """Deliver one observation. Omitted acquisition times use the current board clock."""
+        """Switch from the BMI088 model to exact, latched observation injection.
+
+        Values, status and acquisition times remain fixed until the next call.
+        Omitted acquisition times use the current board clock. The external
+        chassis uses this path to deliver its independently sampled IMU model.
+        """
         if len(acceleration) != 3 or len(angular_velocity) != 3:
             raise ValueError("IMU vectors must have three components")
         for stamp in (accel_us, gyro_us):

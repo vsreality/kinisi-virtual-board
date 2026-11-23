@@ -28,7 +28,7 @@ class IMUObservationTests(unittest.TestCase):
     def test_frozen_identical_and_independently_reordered_samples(self):
         with FirmwareBoard(firmware=FIRMWARE) as board:
             board.advance(.1)
-            self.assertEqual(read_observation(board), (2, *self.unchanged))
+            self.assertEqual(read_observation(board)[0], 0)
 
             def inject(**kwargs):
                 board.set_imu(self.values[:3], self.values[3:], **kwargs)
@@ -75,6 +75,44 @@ class IMUObservationTests(unittest.TestCase):
             board.set_imu()
             self.assertEqual(read_observation(board), (1, *self.unchanged))
 
+    def test_default_model_independent_clocks_and_cached_reads(self):
+        with FirmwareBoard(firmware=FIRMWARE) as board:
+            self.assertEqual(read_observation(board), (2, *self.unchanged))
+            board.advance(.05)
+            first = read_observation(board)
+            self.assertEqual(first[0], 0)
+            self.assertEqual(first[2:], (50000, 42500))
+            self.assertEqual(read_observation(board), first)
+            board.advance(.001)
+            self.assertEqual(read_observation(board), first)
+            board.advance(.0015)
+            gyro = read_observation(board)
+            self.assertEqual(gyro[2:], (50000, 52500))
+            self.assertEqual(gyro[1][:3], first[1][:3])
+            self.assertNotEqual(gyro[1][3:], first[1][3:])
+            board.advance(.0075)
+            accel = read_observation(board)
+            self.assertEqual(accel[2:], (60000, 52500))
+            self.assertNotEqual(accel[1][:3], gyro[1][:3])
+            self.assertEqual(accel[1][3:], gyro[1][3:])
+
+    def test_default_model_reproducibility_and_configuration(self):
+        def observe(**configuration):
+            with FirmwareBoard(firmware=FIRMWARE, **configuration) as board:
+                board.advance(.1)
+                return read_observation(board)
+        default = observe()
+        self.assertEqual(default, observe(imu_seed=1, temperature_c=25.))
+        self.assertNotEqual(default[1], observe(imu_seed=2)[1])
+        self.assertNotEqual(default[1], observe(temperature_c=45.)[1])
+        self.assertNotEqual(default[1], (0., 0., 9.80665, 0., 0., 0.))
+        for invalid in (-1, 2**32, 1.5, True):
+            with self.assertRaises(ValueError):
+                FirmwareBoard(firmware=FIRMWARE, imu_seed=invalid)
+        for invalid in (float('nan'), float('inf'), -float('inf'), -41., 86.):
+            with self.assertRaises(ValueError):
+                FirmwareBoard(firmware=FIRMWARE, temperature_c=invalid)
+
     def test_baseline_delivers_previous_acquisition_to_hal(self):
         observations = []
 
@@ -88,7 +126,14 @@ class IMUObservationTests(unittest.TestCase):
         cases["courses"]["velocity"]["duration_ms"] = 30
         with tempfile.TemporaryDirectory() as folder, patch.object(encoder_baseline, "FirmwareBoard", RecordingBoard):
             encoder_baseline.run_case(Path(folder) / "case", FIRMWARE, cases, "differential", "velocity", "nominal", 131)
-        self.assertEqual(observations, [(t, 0, t - 10000, t - 10000) for t in range(600000, 640000, 10000)])
+        self.assertEqual(observations[0], (0, 2, 27, 31))
+        for t, status, accel, gyro in observations[1:]:
+            self.assertEqual(status, 0)
+            self.assertGreaterEqual(t - accel, 10000)
+            self.assertGreaterEqual(t - gyro, 10000)
+            if t % 10000 == 0:
+                self.assertEqual((accel, gyro), (t - 10000, t - 17500))
+        self.assertTrue(any(t % 10000 == 2500 for t, *_ in observations))
 
     def test_stationary_warmup_is_delayed_and_preserves_course(self):
         deliveries = []
@@ -99,7 +144,8 @@ class IMUObservationTests(unittest.TestCase):
                 deliveries.append((self.now_us, times, (*acceleration, *angular_velocity)))
 
         def setup(ask):
-            self.assertFalse(deliveries)
+            self.assertEqual(len(deliveries), 1)  # Explicit ownership, still unseen at boot.
+            self.assertEqual(deliveries[0][:2], (0, dict(accel_us=0, gyro_us=0)))
             self.assertEqual(ask("GET_ODOMETRY_FREQUENCY"), bytes([50, 0]))
             setup_calls.append(True)
 
@@ -115,7 +161,11 @@ class IMUObservationTests(unittest.TestCase):
             for name in ("sensors.csv", "firmware.csv", "reference.csv", "targets.csv"):
                 self.assertEqual((plain / name).read_bytes(), (warm / name).read_bytes(), name)
         self.assertEqual(setup_calls, [True])
-        self.assertEqual([t for t, _, _ in deliveries], list(range(10000, 640000, 10000)))
         for t, times, _ in deliveries:
-            self.assertEqual(times, dict(accel_us=t - 10000, gyro_us=t - 10000))
+            for stamp in times.values():
+                if stamp:
+                    self.assertGreaterEqual(t-stamp, 10000)
+            if t >= 600000 and t % 10000 == 0:
+                self.assertEqual(times, dict(accel_us=t-10000, gyro_us=t-17500))
+        self.assertEqual(deliveries[-1][0], 630000)
         self.assertGreater(len({values for t, _, values in deliveries if t < 600000}), 1)

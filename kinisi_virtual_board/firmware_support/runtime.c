@@ -26,6 +26,7 @@
 #include <math.h>
 #include <setjmp.h>
 #include <string.h>
+#include "bmi088_model.h"
 
 _Static_assert(sizeof(double) == 8, "Kinisi wire format requires 64-bit doubles");
 
@@ -64,6 +65,13 @@ static uint8_t motor_ready[4], motor_reverse[4], motor_mode[4];
 static uint8_t encoder_ready[4], encoder_reverse[4], pins[10], led;
 static hw_imu_sample_t imu = {.acceleration_z = 9.80665};
 static uint64_t imu_accel_us, imu_gyro_us;
+static bmi088_model_t imu_model;
+static uint32_t imu_seed = 1;
+static double imu_temperature_c = 25.;
+static bool imu_injected, imu_started;
+static double shaft_velocity[4];
+static platform_odometry_t previous_body_velocity;
+static double body_acceleration[3] = {0., 0., 9.80665}, body_gyro[3];
 static hw_motor_faults_t faults[4];
 static uint32_t fault_sequence[4];
 static hw_motor_current_limit_t limits[4];
@@ -329,6 +337,8 @@ bool sim_usb_send(uint8_t *data, uint8_t length) {
     memcpy(tx + tx_size, data, length); tx_size += length; return true;
 }
 API void sim_init(void) {
+    bmi088_init(&imu_model, imu_seed, imu_temperature_c);
+    imu_started = true;
     if (!fram_loaded) { memset(fram, 0xff, sizeof(fram)); fram_loaded = true; }
 #ifdef SIM_DRIVER_HAL
     hw_motor_init();
@@ -364,7 +374,29 @@ static void run_tasks(void) {
 }
 API int sim_poll(uint64_t time_us) {
     if (time_us < now_us) return 6;
+    const double dt = (double)(time_us - now_us) / 1e6;
     now_us = time_us;
+    if (!imu_injected) {
+        /* Configured platforms assume attached no-slip wheels. Convert actual
+         * plant shaft rates, not targets/counts/estimated pose, through the
+         * configured forward kinematics. Encoder direction specifies mounting.
+         * The external chassis bypasses this through exact observation injection. */
+        if (dt > 0.) {
+            uint8_t indexes[4] = {0, 1, 2, 3};
+            double wheels[4];
+            for (unsigned i = 0; i < 4; ++i)
+                wheels[i] = encoder_reverse[i] ? -shaft_velocity[i] : shaft_velocity[i];
+            platform_odometry_t body = platform_update_odometry(indexes, wheels, 4);
+            body_acceleration[0] = (body.x - previous_body_velocity.x) / dt - body.t * body.y;
+            body_acceleration[1] = (body.y - previous_body_velocity.y) / dt + body.t * body.x;
+            body_gyro[2] = body.t;
+            previous_body_velocity = body;
+        }
+        bmi088_advance(&imu_model, now_us, body_acceleration, body_gyro);
+        memcpy(&imu, imu_model.values, sizeof(imu));
+        imu_accel_us = imu_model.accel_us;
+        imu_gyro_us = imu_model.gyro_us;
+    }
 #ifdef SIM_DUAL_TRANSPORT
     sim_transport_expire();
     run_tasks();
@@ -443,6 +475,7 @@ API int sim_ready(void) { return session.ready_announced; }
 API void sim_drop(uint8_t command, unsigned count) { dropped[command] = count; }
 API void sim_encoder(uint8_t index, uint16_t value) { if (index < 4) counts[index] = value; }
 API uint16_t sim_encoder_count(uint8_t i) { return i < 4 ? counts[i] : 0; }
+API void sim_shaft_velocity(const double *values) { memcpy(shaft_velocity, values, sizeof(shaft_velocity)); }
 API double sim_resolution(uint8_t i) { return i < 4 ? resolutions[i] : 0; }
 #ifndef SIM_DRIVER_HAL
 API double sim_pwm(uint8_t i) { return i < 4 ? pwm[i] : 0; }
@@ -450,7 +483,14 @@ API int sim_reverse(uint8_t i) { return i < 4 ? motor_reverse[i] : 0; }
 API int sim_mode(uint8_t i) { return i < 4 ? motor_mode[i] : 0; }
 #endif
 API void sim_temperature(double value, int status) { temperature = value; temperature_status = status; }
+API int sim_imu_configure(uint32_t seed, double temperature_c) {
+    if (imu_started || !isfinite(temperature_c) || temperature_c < -40. || temperature_c > 85.) return 0;
+    imu_seed = seed;
+    imu_temperature_c = temperature_c;
+    return 1;
+}
 API void sim_imu_observation(const double *values, int status, uint64_t accel_us, uint64_t gyro_us) {
+    imu_injected = true; /* Exact injected values/status/timestamps stay frozen. */
     memcpy(&imu, values, sizeof(imu));
     imu_status = status;
     imu_accel_us = accel_us;

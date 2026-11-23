@@ -37,7 +37,7 @@ class BaselineScoreTests(unittest.TestCase):
                             origin_us=10000, duration_ms=40, firmware_build_id="fixture")
                 (folder/"case.json").write_text(json.dumps(case))
                 times = range(10000, 60000, 10000)
-                write_rows(folder/"sensors.csv", scorer.HEADERS["sensors.csv"],
+                write_rows(folder/"sensors.csv", "at_us imu_acquired_us enc0 enc1 enc2 enc3 ax ay az gx gy gz",
                            [(t,t-10000,0,0,0,0,0,0,9.8,0,0,0) for t in times])
                 write_rows(folder/"targets.csv", "at_us x y yaw", [(10000,0,0,0), (20000,.2,0,0)])
                 write_rows(folder/"reference.csv", "at_us x y yaw vx vy wz", [(t,0,0,0,0,0,0) for t in times])

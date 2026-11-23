@@ -174,8 +174,11 @@ board.drop_next_reply("PING")                    # Executes; reply is lost
 Sensor methods accept optional hardware `status` integers: temperature/IMU use
 0=OK, 1=unavailable, 2=not-ready, 3=I/O-error; current uses 0=OK, 1=unavailable,
 2=out-of-range, 3=I/O-error. The shim models initial temperature and IMU settling
-at 300 ms and 50 ms. It does not reproduce sensor conversion cadence or recovery
-transactions. v0.3 reports sensors/driver functions absent per its board definition.
+at 300 ms and 50 ms. On v0.4 the automatic BMI088 producer samples accel and gyro
+independently. `set_imu` selects exact injected readings for that board instance.
+Temperature conversion cadence and bus recovery are outside the shim.
+v0.3 reports sensors/driver functions absent per its board definition.
+[BMI088 settings and timing](bmi088.md)
 
 Faults feed real command/controller checks and event subscription sequences.
 The driver itself is simulated: clearing faults succeeds for an initialized

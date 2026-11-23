@@ -37,6 +37,7 @@ public:
     int (*reverse)(uint8_t);
     int (*mode)(uint8_t);
     void (*encoder)(uint8_t, uint16_t);
+    void (*shaft_velocity)(const double*);
     explicit Firmware(const std::filesystem::path& file) {
 #ifdef _WIN32
         handle_ = LoadLibraryExW(std::filesystem::absolute(file).c_str(), nullptr,
@@ -49,6 +50,7 @@ public:
 #define LOAD(name) name = symbol<decltype(name)>("sim_" #name)
             LOAD(init); LOAD(feed); LOAD(poll); LOAD(read); LOAD(deadline); LOAD(disconnect);
             LOAD(lost); LOAD(pwm); LOAD(resolution); LOAD(reverse); LOAD(mode); LOAD(encoder);
+            LOAD(shaft_velocity);
 #undef LOAD
             init();
         } catch (...) { unload(); throw; }

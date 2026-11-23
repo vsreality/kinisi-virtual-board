@@ -1,6 +1,6 @@
 """External planar plant for encoder/IMU evaluations. No firmware dependencies."""
 import math
-import random
+from .bmi088 import BMI088, PERIOD_US
 
 
 def rotate(x, y, angle):
@@ -54,21 +54,16 @@ class Chassis:
 
 
 class VirtualIMU:
-    """Fixed board-aligned mount at chassis origin; output is in BMI088 native axes."""
+    """Compatibility sampler for callers supplying one input per 10 ms frame.
+
+    For sample identity or delivery timing use BMI088.advance directly.
+    """
     def __init__(self, seed, *, noise_seed=None):
-        self.rng = random.Random(seed)
-        self.bias = [self.rng.uniform(-.035, .035) for _ in range(3)]
-        self.bias += [self.rng.uniform(-.004, .004) for _ in range(3)]
-        if noise_seed is not None:
-            self.rng.seed(noise_seed)
+        self.sensor = BMI088(seed, noise_seed=noise_seed)
+        self.bias = self.sensor.bias
+        self._at_us = 2500
 
     def sample(self, specific_force, yaw_rate):
-        values = (-specific_force[0], -specific_force[1], specific_force[2], 0., 0., yaw_rate)
-        sample = []
-        for index, value in enumerate(values):
-            accel = index < 3
-            full_scale = 6 * 9.80665 if accel else math.radians(500)
-            quantum = full_scale / 32768
-            noisy = value + self.bias[index] + self.rng.gauss(0, .025 if accel else .002)
-            sample.append(min(32767, max(-32768, round(noisy / quantum))) * quantum)
-        return sample
+        self._at_us += PERIOD_US
+        self.sensor.advance(self._at_us, specific_force, (0., 0., yaw_rate))
+        return list(self.sensor.values)

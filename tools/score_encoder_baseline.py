@@ -12,7 +12,7 @@ from itertools import product
 
 HEADERS = {
     "firmware.csv": "at_us odom_us clock_mode clock_quality x y yaw controller_dispatches pwm0 pwm1 pwm2 pwm3",
-    "sensors.csv": "at_us imu_acquired_us enc0 enc1 enc2 enc3 ax ay az gx gy gz",
+    "sensors.csv": "at_us accel_us gyro_us enc0 enc1 enc2 enc3 ax ay az gx gy gz",
     "reference.csv": "at_us x y yaw vx vy wz",
     "targets.csv": "at_us x y yaw",
 }
@@ -24,7 +24,10 @@ def read_csv(path):
         rows = []
         try:
             fields = reader.fieldnames or []
-            if len(fields) != len(set(fields)) or not set(HEADERS[path.name].split()).issubset(fields):
+            required = HEADERS[path.name].split()
+            if path.name == "sensors.csv" and "imu_acquired_us" in fields and "accel_us" not in fields:
+                required = [k for k in required if k not in ("accel_us", "gyro_us")] + ["imu_acquired_us"]
+            if len(fields) != len(set(fields)) or not set(required).issubset(fields):
                 raise ValueError("Missing or duplicate columns")
             for row in reader:
                 if None in row or None in row.values():
@@ -88,12 +91,25 @@ def score_case(directory, spec):
     origin = case["origin_us"]
     duration = case["duration_ms"]/1000
     times = list(range(origin, origin + case["duration_ms"]*1000 + 1, dt_us))
-    for trace in (firmware, sensors, reference):
+    for trace in (firmware, sensors):
         if [r["at_us"] for r in trace] != times:
             raise ValueError("Missing, duplicate, or shifted acquisition")
-    if any(s["at_us"] - s["imu_acquired_us"] != dt_us for s in sensors):
+    model = case.get("imu_model")
+    reference_times = list(range(case["reference_start_us"], times[-1]+1, model["integration_us"])) if model else times
+    if [r["at_us"] for r in reference] != reference_times:
+        raise ValueError("Missing, duplicate, or shifted reference")
+    if model:
+        for s in sensors:
+            for channel in ("accel", "gyro"):
+                latest = s["at_us"] - model["transport_delay_us"]
+                expected = latest - (latest - model[channel + "_phase_us"]) % model["source_period_us"]
+                if s[channel + "_us"] != expected:
+                    raise ValueError("Independent IMU provenance mismatch")
+    elif any(s["at_us"] - s["imu_acquired_us"] != dt_us for s in sensors):
         raise ValueError("IMU provenance mismatch")
     truth_at = {r["at_us"]: pose(r) for r in reference}
+    by_time = {r["at_us"]: r for r in reference}
+    reference = [by_time[t] for t in times]
     command_at = {r["at_us"]: pose(r) for r in targets}
     course = spec["courses"][case["mode"]]
     schedule = {origin+t*1000: (v[0], 0 if case["preset"]=="differential" and case["mode"]=="velocity"
@@ -167,8 +183,14 @@ def score_case(directory, spec):
                   pwm_response_ms=response_ms(pwm_on), odometry_response_ms=response_ms(odom_on),
                   ground_motion_response_ms=response_ms(body_on), held_sample_age_max_ms=max(ages),
                   held_sample_age_mean_ms=stats.mean(ages), odometry_hz=1e6/stats.mean(periods),
-                  odometry_period_max_ms=max(periods)/1000, imu_hz=1/dt,
+                  odometry_period_max_ms=max(periods)/1000,
+                  imu_hz=1e6/model["source_period_us"] if model else 1/dt,
                   control_hz=(firmware[-1]["controller_dispatches"]-firmware[0]["controller_dispatches"])/duration)
+    if model:
+        for channel in ("accel", "gyro"):
+            age = [(s["at_us"]-s[channel+"_us"])/1000 for s in sensors]
+            values[channel+"_delivery_age_max_ms"] = max(age)
+            values[channel+"_delivery_age_mean_ms"] = stats.mean(age)
     if track_speed:
         values.update(tracking_linear_velocity_rmse_m_s=rms(track_speed), tracking_yaw_rate_rmse_rad_s=rms(track_wz))
     return values

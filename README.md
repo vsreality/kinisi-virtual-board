@@ -55,6 +55,7 @@ hardware. Missing firmware handlers remain visible to tests.
 
 - [Standalone architecture, builds, driver setup and limits](docs/standalone.md)
 - [Python firmware harness and deterministic fault injection](docs/native-firmware.md)
+- [v0.4 BMI088 measurements, timing and model limits](docs/bmi088.md)
 - [Legacy Python serial endpoints](docs/serial.md)
 - [Legacy Python behavioral model](docs/python-model.md)
 

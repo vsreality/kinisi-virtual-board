@@ -9,7 +9,10 @@ import shutil
 import subprocess
 import tempfile
 
-import encoder_baseline as baseline
+if __package__:
+    from . import encoder_baseline as baseline
+else:
+    import encoder_baseline as baseline
 
 PRESETS = ("differential", "omni", "mecanum")
 SEEDS = (131, 277, 419, 587, 743)
@@ -54,43 +57,58 @@ def export_recording(raw, out, case, course, preset, duration_ms):
     probes = {}
     path_m = 0.
     previous = (0., 0.)
-    with (raw / "sensors.csv").open(newline="") as source, (raw / "reference.csv").open(newline="") as truth, \
-            imu_file.open("x", newline="") as imu_out, reference_file.open("x", newline="") as ref_out:
-        sensors, references = csv.DictReader(source), csv.DictReader(truth)
+    model = meta["imu_model"]
+    with (raw / "sensors.csv").open(newline="") as source, (raw / "reference.csv").open(newline="") as truth:
+        sensors = list(csv.DictReader(source))
+        reader = csv.DictReader(truth)
+        reference_fields = reader.fieldnames
+        references = list(reader)
+    end_delivery = start + (duration_ms + STEP_MS) * 1000
+    expected_reference = list(range(meta["reference_start_us"], end_delivery + 1, model["integration_us"]))
+    if [int(r["at_us"]) for r in references] != expected_reference:
+        raise ValueError("Missing, duplicate or shifted independent reference")
+    if len(sensors) != samples + 1:
+        raise ValueError("Unexpected sensor recording length")
+    by_time = {int(r["at_us"]): r for r in references}
+    for i, s in enumerate(sensors):
+        delivered = start + i * STEP_MS * 1000
+        if int(s["at_us"]) != delivered:
+            raise ValueError("Missing, duplicate or shifted sensor delivery")
+        for channel in ("accel", "gyro"):
+            latest = delivered - model["transport_delay_us"]
+            expected = latest - (latest - model[channel + "_phase_us"]) % model["source_period_us"]
+            if int(s[channel + "_us"]) != expected or expected not in by_time:
+                raise ValueError("Independent channel timestamp has no matching reference")
+        if not all(math.isfinite(float(s[k])) for k in CHANNELS):
+            raise ValueError("Nonfinite sensor observation")
+    # Retain the first course accel acquisition and the earlier independently phased gyro.
+    # Reference rows cover both channels exactly, as well as every delivery including the tail.
+    exported = sensors[1:]
+    first_source = min(int(exported[0][k]) for k in ("accel_us", "gyro_us"))
+    with imu_file.open("x", newline="") as imu_out, reference_file.open("x", newline="") as ref_out:
         imu = csv.writer(imu_out)
-        ref = csv.DictWriter(ref_out, fieldnames=references.fieldnames)
+        ref = csv.DictWriter(ref_out, fieldnames=reference_fields)
         imu.writerow(("delivered_us", "accel_us", "gyro_us", *CHANNELS))
         ref.writeheader()
-        # Drop the pre-origin acquisition. One extra simulation step delivers the final observation.
-        first = next(sensors)
-        if int(first["at_us"]) != start or int(first["imu_acquired_us"]) != start - STEP_MS * 1000:
-            raise ValueError("Unexpected pre-origin observation")
-        for i in range(samples):
-            s, r = next(sensors), next(references)
-            elapsed_ms = i * STEP_MS
-            stamp = start + elapsed_ms * 1000
-            if (int(s["imu_acquired_us"]), int(r["at_us"]), int(s["at_us"])) != (stamp, stamp, stamp + STEP_MS * 1000):
-                raise ValueError(f"Sensor or reference timing mismatch at row {i}")
-            if not all(math.isfinite(float(s[k])) for k in CHANNELS) or not all(math.isfinite(float(v)) for v in r.values()):
-                raise ValueError(f"Nonfinite observation at row {i}")
-            imu.writerow((s["at_us"], stamp, stamp, *(s[k] for k in CHANNELS)))
-            ref.writerow(r)
+        for s in exported:
+            imu.writerow((s["at_us"], s["accel_us"], s["gyro_us"], *(s[k] for k in CHANNELS)))
+        for r in references:
+            if not all(math.isfinite(float(v)) for v in r.values()):
+                raise ValueError("Nonfinite independent reference")
+            at_us = int(r["at_us"])
+            if at_us >= first_source:
+                ref.writerow(r)
+            elapsed_us = at_us - start
             pose = float(r["x"]), float(r["y"])
-            path_m += math.dist(previous, pose)
-            previous = pose
             twist = tuple(float(r[k]) for k in ("vx", "vy", "wz"))
-            if course == "stationary" or elapsed_ms <= 2000:
+            if 0 <= elapsed_us <= duration_ms * 1000:
+                path_m += math.dist(previous, pose)
+                previous = pose
+            if course == "stationary" or elapsed_us <= 2_000_000:
                 if any(twist) or any(pose) or float(r["yaw"]):
-                    raise ValueError(f"Stationary interval moved at {elapsed_ms} ms")
-            elif (elapsed_ms - 2000) % 10_000 in (2000, 4200, 6600, 9800):
-                probes[elapsed_ms] = twist
-        tail = next(references)
-        if int(tail["at_us"]) != stamp + STEP_MS * 1000 or next(references, None) or next(sensors, None):
-            raise ValueError("Unexpected recording length")
-        # The final delayed observation also needs an independent delivery-time reference.
-        if not all(math.isfinite(float(v)) for v in tail.values()):
-            raise ValueError("Nonfinite final delivery reference")
-        ref.writerow(tail)
+                    raise ValueError(f"Stationary interval moved at {elapsed_us} us")
+            elif elapsed_us % 1000 == 0 and (elapsed_us // 1000 - 2000) % 10_000 in (2000, 4200, 6600, 9800):
+                probes[elapsed_us // 1000] = twist
     for cycle in range(6) if course != "stationary" else ():
         base = 2000 + cycle * 10_000
         forward, midway, reverse, stopped = [probes[base + offset] for offset in (2000, 4200, 6600, 9800)]
@@ -104,7 +122,9 @@ def export_recording(raw, out, case, course, preset, duration_ms):
             if preset != "differential" and (forward[1] <= .01 or reverse[1] >= -.01):
                 raise ValueError(f"Missing lateral motion in cycle {cycle + 1}")
     shutil.copyfile(raw / "targets.csv", targets_file)
-    return dict(samples=samples, start_acquired_us=start, end_acquired_us=stamp, duration_ms=duration_ms,
+    return dict(samples=samples, source_origin_us=start, start_acquired_us=first_source,
+                end_acquired_us=int(exported[-1]["accel_us"]), end_delivered_us=end_delivery,
+                imu_model=model, duration_ms=duration_ms,
                 ground_path_m=path_m, firmware_build_id=meta["firmware_build_id"],
                 imu_file=imu_file.relative_to(out).as_posix(), imu_sha256=digest(imu_file),
                 reference_path=reference_file.relative_to(out).as_posix(), reference_sha256=digest(reference_file),
@@ -145,7 +165,7 @@ def main():
                         if not build.exists():
                             shutil.copyfile(raw.parent / build.name, build)
                         record = export_recording(raw, out, name, course, preset, duration_ms)
-                        manifest["cases"].append(dict(case=name, dataset_id="imu-development-v1/" + name,
+                        manifest["cases"].append(dict(case=name, dataset_id="imu-development-bmi088-v1/" + name,
                                                       preset=preset, course=course, surface="nominal",
                                                       seed=seed, **record))
                     except Exception as exc:

@@ -10,17 +10,50 @@ import shutil
 import struct
 import subprocess
 import sys
+from collections import deque
 from contextlib import ExitStack
 from itertools import product
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from kinisi_virtual_board import FirmwareBoard
-from kinisi_virtual_board.chassis import Chassis, VirtualIMU
+from kinisi_virtual_board.chassis import Chassis
+from kinisi_virtual_board.bmi088 import BMI088, MODEL_ID
 from kinisi_virtual_board.firmware_build import DEFAULT_FIRMWARE
 
 CASES = Path(__file__).with_name("encoder_baseline_cases.json")
 AXES = ("x", "y", "yaw")
+IMU_DELAY_US = 10000
+INTEGRATION_US = 2500
+
+
+class DelayedIMU:
+    """Independent register events delivered causally after fixed transport delay."""
+    def __init__(self, seed, temperature_c=25.0):
+        self.model = BMI088(seed, temperature_c=temperature_c)
+        self.pending = deque()
+        self.source_stamps = [0, 0]
+        self.stamps = [0, 0]
+        self.values = list(self.model.values)
+
+    def advance(self, at_us, acceleration, angular_velocity):
+        self.model.advance(at_us, body_accel=acceleration, body_gyro=angular_velocity)
+        for channel, stamp in enumerate((self.model.accel_us, self.model.gyro_us)):
+            if stamp != self.source_stamps[channel]:
+                self.pending.append((stamp + IMU_DELAY_US, channel, stamp,
+                                     tuple(self.model.values[channel*3:channel*3+3])))
+                self.source_stamps[channel] = stamp
+        # Integration stops at each independent source event, so queue order is causal.
+        changed = False
+        while self.pending and self.pending[0][0] <= at_us:
+            _, channel, stamp, values = self.pending.popleft()
+            self.stamps[channel] = stamp
+            self.values[channel*3:channel*3+3] = values
+            changed = True
+        return changed
+
+    def deliver(self, board):
+        board.set_imu(self.values[:3], self.values[3:], accel_us=self.stamps[0], gyro_us=self.stamps[1])
 
 
 class Wire:
@@ -113,7 +146,8 @@ def configure(wire, spec, preset, mode):
     return rates, readback
 
 
-def run_case(directory, firmware, spec, preset, mode, surface, seed, *, setup=None, stationary_warmup=False):
+def run_case(directory, firmware, spec, preset, mode, surface, seed, *, setup=None, stationary_warmup=False,
+             temperature_c=25.0):
     """Call setup(ask) after configuration, then optionally feed stationary IMU samples before the course."""
     directory.mkdir()
     rng = random.Random(seed)
@@ -121,40 +155,40 @@ def run_case(directory, firmware, spec, preset, mode, surface, seed, *, setup=No
     motor_tau = rng.uniform(.045, .055)
     body_tau = rng.uniform(.075, .105)
     chassis = Chassis(preset, spec["presets"][preset], (body_tau, body_tau, body_tau * .8))
-    imu = VirtualIMU(seed + 10000)
+    imu = DelayedIMU(seed + 10000, temperature_c)
     dt_ms = spec["step_ms"]
-    dt = dt_ms / 1000
+    if type(dt_ms) is not int or dt_ms * 1000 % INTEGRATION_US or dt_ms <= 0:
+        raise ValueError("Recorder period must be a positive whole multiple of 2.5 ms")
     recipe = spec["courses"][mode]
     events = dict(recipe["targets"])
     slip_intervals = spec["surfaces"][surface]
     with FirmwareBoard(firmware=firmware, revision=spec["revision"], max_speed=speed,
                        time_constant=motor_tau) as board, ExitStack() as files:
+        imu.deliver(board)  # Select explicit producer ownership before any firmware task runs.
         wire = Wire(board)
         rates, readback = configure(wire, spec, preset, mode)
         if setup is not None:
             setup(wire.ask)
-        if stationary_warmup:
-            # Match the course bias while drawing pre-course noise from a separate stream.
-            stationary = VirtualIMU(seed + 10000, noise_seed=f"stationary-warmup:{seed}")
-            if not 1 <= dt_ms <= 600:
-                raise ValueError("Warm-up needs an observation period between 1 and 600 ms")
-            periods, offset_ms = divmod(600, dt_ms)
-            board.advance(offset_ms / 1000)
-            for _ in range(periods - 1):
-                acquired_us = board.now_us
-                values = stationary.sample((0., 0., 9.80665), 0.)
-                board.advance(dt)
-                board.set_imu(values[:3], values[3:], accel_us=acquired_us, gyro_us=acquired_us)
-        else:
-            board.advance(.6 - dt)
-        previous_imu = imu.sample((0., 0., 9.80665), 0.)
-        previous_imu_us = board.now_us
-        board.advance(dt)
+        # Advance the same producer from boot in both modes. Only early delivery is optional.
+        # Keep pre-origin reference rows for the gyro's independent acquisition phase.
+        warm_reference = []
+        while board.now_us < 600000:
+            board.advance(INTEGRATION_US / 1e6)
+            changed = imu.advance(board.now_us, (0., 0., 9.80665), (0., 0., 0.))
+            if changed and stationary_warmup:
+                imu.deliver(board)
+            if board.now_us >= 580000:
+                warm_reference.append([board.now_us, *chassis.pose, *chassis.twist])
         origin = board.now_us
         metadata = dict(preset=preset, mode=mode, surface=surface, seed=seed, origin_us=origin,
                         max_speed_rad_s=speed, motor_tau_s=motor_tau, body_tau_s=chassis.response_s,
-                        imu_bias=imu.bias, rates=rates, configuration_readback=readback, firmware_build_id=board.build["build_id"],
+                        imu_bias=imu.model.bias, rates=rates, configuration_readback=readback, firmware_build_id=board.build["build_id"],
                         schema_sha256=board.schema.sha256, duration_ms=recipe["duration_ms"])
+        metadata["imu_model"] = dict(id=MODEL_ID, seed=seed + 10000, temperature_c=temperature_c,
+            source_sha256=hashlib.sha256((ROOT/"kinisi_virtual_board/bmi088.py").read_bytes()).hexdigest(),
+            source_period_us=10000, accel_phase_us=0, gyro_phase_us=2500,
+            transport_delay_us=IMU_DELAY_US, integration_us=INTEGRATION_US)
+        metadata["reference_start_us"] = warm_reference[0][0]
         if stationary_warmup:
             metadata["stationary_warmup_ms"] = 600
         if setup is not None:
@@ -163,26 +197,24 @@ def run_case(directory, firmware, spec, preset, mode, surface, seed, *, setup=No
         if not (directory.parent/"firmware-build.json").exists():
             dump(directory.parent/"firmware-build.json", board.build)
         obs = writer(files, directory, "sensors.csv",
-                     ["at_us", "imu_acquired_us", *[f"enc{i}" for i in range(4)],
+                     ["at_us", "accel_us", "gyro_us", *[f"enc{i}" for i in range(4)],
                       "ax", "ay", "az", "gx", "gy", "gz"])
         est = writer(files, directory, "firmware.csv",
                      ["at_us", "odom_us", "clock_mode", "clock_quality", *AXES, "controller_dispatches",
                       *[f"pwm{i}" for i in range(4)]])
         truth = writer(files, directory, "reference.csv", ["at_us", *AXES, "vx", "vy", "wz"])
         commands = writer(files, directory, "targets.csv", ["at_us", *AXES])
+        truth.writerows(warm_reference)
 
         def record():
             # Expose only delayed, biased, noisy and quantized sensor measurements to the board.
-            board.set_imu(previous_imu[:3], previous_imu[3:], accel_us=previous_imu_us, gyro_us=previous_imu_us)
+            imu.deliver(board)
             measured = struct.unpack("<6d", wire.ask("GET_IMU"))
-            obs.writerow([board.now_us, previous_imu_us, *board.encoder_counts, *measured])
+            obs.writerow([board.now_us, *imu.stamps, *board.encoder_counts, *measured])
             pose = struct.unpack("<QBB3d", wire.ask("GET_PLATFORM_ODOMETRY"))
             est.writerow([board.now_us, *pose, board.controller_dispatches, *board.motor_pwm])
-            truth.writerow([board.now_us, *chassis.pose, *chassis.twist])
 
         record()
-        previous_imu = imu.sample((0., 0., 9.80665), 0.)  # Newly acquired at the origin.
-        previous_imu_us = origin
         for elapsed in range(0, recipe["duration_ms"], dt_ms):
             if elapsed in events:
                 x, y, yaw = events[elapsed]
@@ -192,14 +224,16 @@ def run_case(directory, firmware, spec, preset, mode, surface, seed, *, setup=No
                 wire.ask(command, x=x, y=y, t=yaw)
                 commands.writerow([board.now_us, x, y, yaw])
             traction = next((v for start, stop, v in slip_intervals if start <= elapsed < stop), (1.,)*4)
-            previous_angle = tuple(board.motor_angle)
-            board.advance(dt)
-            delta = [end-start for end, start in zip(board.motor_angle, previous_angle)]
-            specific_force = chassis.step(delta, traction, dt)
-            acquired = imu.sample(specific_force, chassis.twist[2])
+            for _ in range(dt_ms * 1000 // INTEGRATION_US):
+                previous_angle = tuple(board.motor_angle)
+                board.advance(INTEGRATION_US / 1e6)
+                delta = [end-start for end, start in zip(board.motor_angle, previous_angle)]
+                specific_force = chassis.step(delta, traction, INTEGRATION_US / 1e6)
+                changed = imu.advance(board.now_us, specific_force, (0., 0., chassis.twist[2]))
+                if changed:
+                    imu.deliver(board)
+                truth.writerow([board.now_us, *chassis.pose, *chassis.twist])
             record()
-            previous_imu = acquired
-            previous_imu_us = board.now_us
         if board.now_us != origin + recipe["duration_ms"] * 1000:
             raise ValueError("Incomplete simulated duration")
 
