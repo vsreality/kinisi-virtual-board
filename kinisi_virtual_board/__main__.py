@@ -23,12 +23,26 @@ def main():
     transport.add_argument("--pty", action="store_true", help="Create a Linux/POSIX virtual serial device for the SDK (no driver install)")
     parser.add_argument("--baudrate", type=int, default=115200, help="Native serial baud rate (default: 115200)")
     parser.add_argument("--check", action="store_true", help="Print schema identity/handler coverage and exit; fail on unsupported commands")
-    regression = parser.add_subparsers(dest="command").add_parser(
+    commands = parser.add_subparsers(dest="command")
+    regression = commands.add_parser(
         "imu-regression", help="Check native v0.4 firmware against public BMI088 trajectories")
     regression.add_argument("--firmware", type=Path, required=True, help="Firmware source checkout to test")
     regression.add_argument("--compiler", default=argparse.SUPPRESS, help="Host GCC/Clang executable (or set CC)")
     regression.add_argument("--seed", type=int, default=8101, help="Reproducible BMI088 unit and noise seed (default: 8101)")
+    qualification = commands.add_parser("imu-qualify", help="Run all 144 public v0.4 chassis IMU qualification cases")
+    qualification.add_argument("--firmware", type=Path, required=True, help="Diagnostic firmware checkout to test")
+    qualification.add_argument("--compiler", default=argparse.SUPPRESS, help="Host C compiler (or set CC)")
+    qualification.add_argument("--out", type=Path, help="Fresh artifact directory (default: build/imu-qualification/<timestamp>)")
+    source = qualification.add_mutually_exclusive_group()
+    source.add_argument("--motion-firmware", type=Path, help="Independent native motion producer checkout (defaults to --firmware)")
+    source.add_argument("--replay", type=Path, help="Replay an archived run's plan and original motion sources")
     args = parser.parse_args()
+    if args.command == "imu-qualify":
+        from .imu_qualification import execute
+        try:
+            return execute(args)
+        except (OSError, ValueError, RuntimeError, LookupError) as error:
+            parser.exit(2, f"IMU qualification incomplete: {error}\n")
     if args.command == "imu-regression":
         from .imu_regression import run
         report, status = run(args.firmware, args.seed, compiler=args.compiler)

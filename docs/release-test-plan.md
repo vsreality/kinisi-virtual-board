@@ -38,13 +38,44 @@ check failed. Exit **2** means the check could not complete, for example because
 the firmware could not build or expected observations were missing. The JSON
 counts preserve incomplete cases even when a measured failure sets the exit code.
 
-For a future release needing new independent cases, pin the firmware first, then
-choose additional profiles or seeds. Archive their inputs or generating source,
-seed, candidate identity and results for replay. Use confidential sealed
-qualification only when a particular study explicitly calls for blinded inputs
-and separate custody. The existing 144-case study has its own verdict. This
-public regression covers the simulated level-motion diagnostic. MCU timing,
-electrical behavior and physical IMU accuracy require other evidence.
+## Full public IMU release qualification
+
+Use the six cases above for quick feedback. For release acceptance, select the
+firmware checkout and run the 144-case chassis qualification from this repository:
+
+```sh
+python -m kinisi_virtual_board imu-qualify --firmware ../kinisi-motor-controller-firmware
+```
+
+The command builds the selected candidate, then draws three fresh seeds and
+writes the complete public plan before simulation. Its default output directory
+is `build/imu-qualification/<timestamp>`; `--out PATH` selects a fresh directory.
+Each result is saved as it finishes. `report.json` counts pending, passed,
+failed and incomplete cases. Exit codes are 0, 1 and 2 as above.
+
+The 135 healthy attempts cross differential, omni and mecanum chassis, five
+motions (stationary, accelerate, brake, reverse and translating turn), three
+seeds and 10/13/17 ms delivery. Nine paired stationary cases exercise producer
+freeze, accelerometer freeze and gyro reordering. A motion-producing native
+board drives the chassis model; the separate tracking board sees its timestamped
+sensor readings. `--motion-firmware PATH` selects an independent checkout for
+the motion producer. The scorer checks actual chassis movement, all 100 expected
+source-time estimates per healthy second, the four numerical limits above,
+35 ms first-publication source age, 50 ms public latency and expiry allowance,
+100 ms fault response, explicit stationary restart and zero diagnostic motor PWM.
+
+Archive the run directory. To test the same plan and recorded motion inputs
+against another checkout, copy the archive if needed and run:
+
+```sh
+python -m kinisi_virtual_board imu-qualify --firmware ../kinisi-motor-controller-firmware --replay path/to/archived-run
+```
+
+Replay uses the saved motion sources and writes a new result directory. An
+unrealized motion or missing observation stays visible. The release procedure
+runs entirely in the local workspace. The earlier confidential study retains
+its historical verdict. MCU timing, physical accuracy, long-duration tracking
+and motion-control feedback require separate evidence.
 
 ## Prepare the run
 
@@ -96,7 +127,7 @@ For the v0.4 persistence cases, run `python -m unittest discover -s tests -p tes
 | DRV8870 sleep on original v0.3 and Nano, `i_3788e3c6057f` | Against protocol 2.17 run `python -m unittest discover -s tests -p test_drv8870_sleep.py -v`. Build each native image with `python tools/build_native.py --revision <revision> --out build/<revision>`, using `0.3.0` and `0.3.1`. | Verify the INIT identity, each regular timer channel and GPIO alternate function. Compare low/low timer coast with GPIO low/low on all eight inputs through sleep, reconnect and release. Confirm at least 2 ms of requested low dwell. On USB and I²C reject sleeping, queued and fragmented drive or brake with error 19. Fresh drive or short brake must affect only the addressed motor or platform wheels. Coast must return both inputs low. Record the simulator build IDs alongside results. Physical waveforms, electrical savings and first-drive latency need bench measurements. |
 | Board idle (v0.4), `i_153acabd4598` | Run `python -m unittest discover -s tests -p test_board_idle.py -v` on protocol 2.16. Then run `python tests/test_board_idle.py --measure` and retain its JSON output with the build manifest. | Verify entry and exit with both prior driver policies, failed transitions and retry, reconnect, heartbeat expiry, time sync, queued commands, fresh telemetry, encoder continuity and v0.3 rejection. Compare one second with four initialized sleeping drivers, temperature and IMU subscriptions at 250 ms, and 20 PING plus 20 POLL commands in each mode. Require 40 ACKs in each, positive sensor reads and events at baseline, zero periodic reads and events in idle. Hardware power, interrupt behavior and wake latency need separate bench evidence. |
 | Shallow board idle on original v0.3 and Nano, `i_df295fb22ad4` | On protocol 2.18 run `python -m unittest discover -s tests -p test_drv8870_idle.py -v`. In the same firmware checkout run `python test/test_usb_vbus/run_tests.py` and `python test/test_configuration/run_tests.py`. Retain both logs, manifests and firmware source revision or fingerprint. Use the 2.17 checkout to check the earlier unsupported contract. | Enter from active motor and platform control. Confirm idle on the same initialized USB session, exchange PING and clock status, and retain the configured clock interval after explicit exit. Check both prior driver policies, repeated commands, failed entry/exit and retry, and blocked USB and I2C queues with fragmented commands straddling wake. All eight modeled inputs stay low on successful exit until fresh actuation. Check Nano motor code never touches PA9 and that the firmware Nano fixture retains USB attachment through idle and handles a subsequent VBUS loss and renewed handshake. |
-| IMU-only tracking · `i_03fc803954c7` | Run the [public IMU regression](#public-imu-regression) against the candidate. | Record its seed, native build ID, peak pose and velocity errors, and all six outcomes. |
+| IMU-only tracking · `i_03fc803954c7` | Run the [full public IMU release qualification](#full-public-imu-release-qualification) on the selected candidate. | Retain the public plan, all 144 outcomes, native build IDs, measured coverage, numerical peaks and fault results. |
 | Encoder and fused tracking · `i_9d6028c11aa8` | Replay matched stationary, straight, turning and slip trajectories for encoder-only and fused modes. Inject IMU bias and sample loss. Compare estimates and closed-loop response against independent reference motion. | Report pose and velocity errors, stationary drift, latency and control tracking against each mode's story limits. Record fixture, units and observation window. |
 | Tracking source selection · `i_0c388c609d20` | Select each supported mode. Switch with fresh and missing sensor data, then reconnect and reset. Exercise unsupported-board behavior. | Requested and active modes, transition behavior and fallback/error match the approved contract. Invalid or stale estimates are observable. |
 | Custom platform geometry · `i_46691a2bffb0` | Compare editable presets with equivalent custom definitions. Supply an independent non-preset layout with a passive encoder wheel. Exercise unsupported motion and degenerate geometry. | Match wheel order, signs, motion constraints and expected targets computed independently from the input geometry. Passive wheels receive no drive target. |

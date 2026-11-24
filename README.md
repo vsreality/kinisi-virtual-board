@@ -50,6 +50,11 @@ reported pose and velocity to known motion. It prints a JSON report with the
 build, seed and per-case results. It runs locally without a serial driver or
 administrator access. See the [cases, limits and exit codes](docs/release-test-plan.md#public-imu-regression).
 
+For the full 144-case chassis qualification run
+`python -m kinisi_virtual_board imu-qualify --firmware ../kinisi-motor-controller-firmware`.
+It saves its public plan, sensor inputs and results automatically.
+[Qualification matrix and replay](docs/release-test-plan.md#full-public-imu-release-qualification)
+
 Use the [controller firmware release test plan](docs/release-test-plan.md) for
 candidate builds, virtual-board regression, story checks and release evidence.
 

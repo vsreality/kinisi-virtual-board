@@ -22,6 +22,7 @@ FAULT_RESPONSE_LIMIT_US = 100_000
 LIMITS = dict(position_m=0.050, body_speed_m_s=0.020,
               yaw_rad=math.radians(2.0), yaw_rate_rad_s=0.020)
 PROFILES = ("stationary", "translate", "brake", "reverse", "turn", "stale")
+FAULT_PROFILES = ("producer_freeze", "accel_freeze", "gyro_reorder")
 VECTORS = ("x", "y", "yaw", "body_vx", "body_vy", "wz")
 PUBLIC_FIELDS = ("public_us", "state", "fault", "flags", "sequence", "timestamp_us",
                  "elapsed_us", "accel_age_us", "gyro_age_us", *VECTORS,
@@ -93,15 +94,16 @@ def score_case(capture):
     """
     meta = capture.get("metadata", {})
     profile, delay = meta.get("profile"), meta.get("delay_us")
+    fault_role = "producer_freeze" if profile == "stale" else profile if profile in FAULT_PROFILES else None
     issues, failures, epochs, peaks = [], [], [], {}
-    if profile not in PROFILES or delay not in (10_000, 13_000, 17_000):
+    if profile not in (*PROFILES, "accelerate", *FAULT_PROFILES) or delay not in (10_000, 13_000, 17_000):
         return dict(outcome="INCOMPLETE", passed=False, case=meta.get("case"), profile=profile,
                     failures=[], incomplete=["Unknown profile or delivery phase"], epochs=[], peaks={},
                     failure_counts={}, incomplete_counts={"Unknown profile or delivery phase": 1},
                     counts=dict(polls=0, reference_rows=0, sensor_rows=0, epochs=0, samples=0, failures=0, incomplete=1), limits=dict(LIMITS))
     if meta.get("error"):
         issues.append(f"Capture error: {meta['error']}")
-    restart = RESTART_US if profile in ("stationary", "stale") else None
+    restart = RESTART_US if profile == "stationary" or fault_role else None
     if meta.get("start_us") != START_US or meta.get("restart_us") != restart:
         issues.append("Capture action schedule differs from profile")
     if meta.get("end_us") != END_US or meta.get("poll_us") != POLL_US:
@@ -116,7 +118,11 @@ def score_case(capture):
         index_time = row["delivered_us"]-START_US-delay
         k, phase = divmod(index_time, SOURCE_PERIOD_US)
         for channel, nominal, keys in ((0, k, ("ax", "ay", "az")), (1, k if phase else k-1, ("gx", "gy", "gz"))):
-            index = 79 if profile == "stale" and 80 <= nominal <= 109 else nominal
+            index = nominal
+            if 80 <= nominal <= 109 and (fault_role == "producer_freeze" or (fault_role == "accel_freeze" and channel == 0)):
+                index = 79
+            if fault_role == "gyro_reorder" and channel == 1 and nominal == 80:
+                index = 76
             expected = START_US+index*SOURCE_PERIOD_US+(2500 if channel else 0)
             source = row["gyro_us" if channel else "accel_us"]
             values = tuple(row[key] for key in keys)
@@ -134,6 +140,8 @@ def score_case(capture):
         if metric not in peaks or value > peaks[metric]["value"]:
             peaks[metric] = dict(value=value, limit=LIMITS[metric], source_us=row["timestamp_us"],
                                  public_us=row["public_us"], start_us=start)
+        if metric not in epoch["peaks"] or value > epoch["peaks"][metric]["value"]:
+            epoch["peaks"][metric] = dict(value=value, source_us=row["timestamp_us"], public_us=row["public_us"])
         if value > LIMITS[metric]:
             fail("accuracy", row, metric=metric, value=value, limit=LIMITS[metric], source_us=row["timestamp_us"])
 
@@ -164,12 +172,12 @@ def score_case(capture):
         valid = [r for r in segment if coherent(r)]
         times = {r["public_us"] for r in segment}
         horizon = max(times, default=start-POLL_US)
-        prefix = profile == "stale" and epoch_index == 0
+        prefix = bool(fault_role) and epoch_index == 0
         confirmed_key = "start_command_us" if epoch_index == 0 else "restart_command_us"
         confirmed = meta.get(confirmed_key) == start
         epoch = dict(start_us=start, complete=not prefix, anchor_us=None, anchor_verified=False,
                      expected_samples=0, observed_samples=0, measured_samples=0,
-                     missing_source_count=0, missing_source_examples=[])
+                     missing_source_count=0, missing_source_examples=[], peaks={}, timing={})
         epochs.append(epoch)
         if not confirmed:
             issues.append(f"Unconfirmed action at {start}")
@@ -181,6 +189,7 @@ def score_case(capture):
             return all(t in times for t in range(((a+999)//1000)*1000, (b//1000)*1000+1, POLL_US))
 
         first = valid[0] if valid else None
+        epoch["first_public_us"] = first["public_us"] if first else None
         if first and covered(first_possible, first["public_us"]):
             epoch.update(anchor_us=first["timestamp_us"], anchor_verified=True)
             if not lo <= first["timestamp_us"] <= hi or (first["timestamp_us"]-START_US-2500) % SOURCE_PERIOD_US:
@@ -192,8 +201,8 @@ def score_case(capture):
                 fail("startup_missing", start_us=start)
             else: issues.append(f"Startup evidence incomplete at {start}")
         anchor = epoch["anchor_us"]
-        anomaly = START_US+80*SOURCE_PERIOD_US+delay
-        last_prefix = START_US+78*SOURCE_PERIOD_US+2500
+        anomaly = START_US+80*SOURCE_PERIOD_US+delay+(2500 if fault_role == "gyro_reorder" else 0)
+        last_prefix = START_US+(79 if fault_role == "gyro_reorder" else 78)*SOURCE_PERIOD_US+2500
         expected = []
         if anchor is not None:
             last = last_prefix if prefix else anchor+WINDOW_US-SOURCE_PERIOD_US
@@ -217,6 +226,9 @@ def score_case(capture):
                 if first and first["public_us"] <= p < (anomaly if prefix else (anchor or lo)+WINDOW_US): fail("premature_invalidity", row)
                 previous = row
                 continue
+            for label, value in (("cached_gyro_age_us", p-source), ("cached_covering_accel_age_us", p-source-7500),
+                                 ("cached_applied_accel_age_us", p-source+2500)):
+                epoch["timing"][label] = max(epoch["timing"].get(label, 0), value)
             if sequence in old_sequences: fail("restart_reused_sequence", row)
             if (source-START_US-2500) % SOURCE_PERIOD_US or source < lo or source > (last_prefix if prefix else hi+WINDOW_US-SOURCE_PERIOD_US):
                 fail("source_outside_window", row)
@@ -237,6 +249,10 @@ def score_case(capture):
             else:
                 seen[source] = row
                 proven = previous is not None and previous["public_us"] == p-POLL_US
+                if proven:
+                    for label, value in (("first_latency_us", p-source), ("first_gyro_age_us", p-source),
+                                         ("first_covering_accel_age_us", p-source-7500), ("first_applied_accel_age_us", p-source+2500)):
+                        epoch["timing"][label] = max(epoch["timing"].get(label, 0), value)
                 if proven and (p-source > PUBLIC_LATENCY_LIMIT_US or p < source): fail("public_latency", row)
                 if proven and max(p-source, p-(source+7500), p-(source-2500)) > FIRST_SOURCE_AGE_LIMIT_US:
                     fail("first_source_age", row)
@@ -294,8 +310,10 @@ def score_case(capture):
         if prefix:
             terminal_row = next((r for r in segment if r["state"] == 3), None)
             deadline = anomaly+FAULT_RESPONSE_LIMIT_US
-            wrong_after = any(r["public_us"] >= deadline and (r["state"], r["fault"]) != (3, 3) for r in segment)
-            wrong_seen = terminal_row and (terminal_row["public_us"] < anomaly or terminal_row["fault"] != 3)
+            code = 4 if fault_role == "gyro_reorder" else 3
+            epoch.update(anomaly_us=anomaly, terminal_deadline_us=deadline, expected_fault=code)
+            wrong_after = any(r["public_us"] >= deadline and (r["state"], r["fault"]) != (3, code) for r in segment)
+            wrong_seen = terminal_row and (terminal_row["public_us"] < anomaly or terminal_row["fault"] != code)
             late = terminal_row is None or terminal_row["public_us"] > deadline
             if wrong_seen or wrong_after or (late and horizon >= deadline and covered(anomaly, deadline)):
                 fail("fault_deadline_or_code", start_us=start)
@@ -304,6 +322,7 @@ def score_case(capture):
             window_end = (anchor or lo)+WINDOW_US
             deadline = (anchor or hi)+WINDOW_US+EXPIRY_LATENCY_LIMIT_US
             terminal_row = next((r for r in segment if r["state"] == 4), None)
+            epoch["terminal_deadline_us"] = deadline
             wrong_after = any(r["public_us"] >= deadline and (r["state"], r["fault"]) != (4, 7) for r in segment)
             early = terminal_row is not None and terminal_row["public_us"] < window_end
             late = terminal_row is None or terminal_row["public_us"] > deadline
@@ -311,6 +330,7 @@ def score_case(capture):
                 fail("expiry_deadline", start_us=start)
             elif late: issues.append(f"Expiry deadline not observed at {start}")
             if horizon < deadline+100_000: issues.append(f"Expiry latch tail incomplete at {start}")
+        epoch["first_terminal_us"] = terminal_row["public_us"] if terminal_row else None
     issues = list(dict.fromkeys(issues))
     outcome = "FAIL" if failures else "INCOMPLETE" if issues else "PASS"
     failure_counts = dict(Counter(f["kind"] + ("."+f["metric"] if "metric" in f else "") for f in failures))
