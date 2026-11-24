@@ -1,4 +1,4 @@
-"""Run a virtual board on native COM/TTY, Linux PTY, or TCP."""
+"""Serve a virtual board or run the public native firmware IMU regression."""
 import argparse
 import json
 from pathlib import Path
@@ -23,7 +23,17 @@ def main():
     transport.add_argument("--pty", action="store_true", help="Create a Linux/POSIX virtual serial device for the SDK (no driver install)")
     parser.add_argument("--baudrate", type=int, default=115200, help="Native serial baud rate (default: 115200)")
     parser.add_argument("--check", action="store_true", help="Print schema identity/handler coverage and exit; fail on unsupported commands")
+    regression = parser.add_subparsers(dest="command").add_parser(
+        "imu-regression", help="Check native v0.4 firmware against public BMI088 trajectories")
+    regression.add_argument("--firmware", type=Path, required=True, help="Firmware source checkout to test")
+    regression.add_argument("--compiler", default=argparse.SUPPRESS, help="Host GCC/Clang executable (or set CC)")
+    regression.add_argument("--seed", type=int, default=8101, help="Reproducible BMI088 unit and noise seed (default: 8101)")
     args = parser.parse_args()
+    if args.command == "imu-regression":
+        from .imu_regression import run
+        report, status = run(args.firmware, args.seed, compiler=args.compiler)
+        print(json.dumps(report, indent=2, allow_nan=False))
+        return status
     try:
         schema = Schema(args.commands or args.firmware / "commands.json")
         if args.backend == "firmware" and args.board_profile:

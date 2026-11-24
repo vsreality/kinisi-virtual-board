@@ -6,7 +6,8 @@ controllers, odometry, watchdog and telemetry code.
 
 The SDK connects to one serial device: a Linux PTY or a Windows COM port.
 The Windows endpoint uses the included UMDF driver. No COM pair or proxy process
-is needed. Python is used to build the simulator, not to run it.
+is needed. Python builds the standalone executable and also provides an
+in-process native firmware harness for regression tests.
 
 ## Build and run
 
@@ -36,6 +37,18 @@ See [standalone setup](docs/standalone.md).
 The current driver targets Windows 11 x64.
 
 ## Test
+
+From this checkout, run the public v0.4 IMU motion regression with Python 3.10+
+and a host GCC or Clang compiler:
+
+```sh
+python -m kinisi_virtual_board imu-regression --firmware ../kinisi-motor-controller-firmware
+```
+
+The command builds the selected firmware, drives its BMI088 input and compares
+reported pose and velocity to known motion. It prints a JSON report with the
+build, seed and per-case results. It runs locally without a serial driver or
+administrator access. See the [cases, limits and exit codes](docs/release-test-plan.md#public-imu-regression).
 
 Use the [controller firmware release test plan](docs/release-test-plan.md) for
 candidate builds, virtual-board regression, story checks and release evidence.

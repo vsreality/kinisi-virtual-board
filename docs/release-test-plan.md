@@ -2,6 +2,50 @@
 
 Use this plan for each controller firmware release. Run the common checks on each candidate, then the cases for its Agora stories. When a story becomes supported, keep its automated regression in subsequent releases. The current release is `r_e71aea9bb26d`. Use virtual v0.4.0 for the common suite and the original v0.3.0 and Nano v0.3.1 images for their profile-specific cases. Physical qualification is deferred for this run.
 
+## Public IMU regression
+
+For ordinary v0.4 IMU development and release checks, run one command from the
+virtual-board checkout. Supply a firmware source checkout with the IMU tracking
+commands, Python 3.10+ and host GCC or Clang. Use `CC` to select the C compiler.
+
+```sh
+python -m kinisi_virtual_board imu-regression --firmware ../kinisi-motor-controller-firmware --seed 8101
+```
+
+Keep the JSON output (redirect stdout to a file if desired), the simulator
+revision, and the firmware revision or source changes. The committed motion
+profiles and seed reproduce the sensor inputs. The default seed is 8101.
+The command builds and runs the firmware locally in process, with no COM port,
+SDK installation, account-specific fixtures, network service or approval step.
+
+Six public cases exercise rest, a rapid forward start, braking, reversal, a
+translating turn with yaw-rate reversal, and stale IMU samples. A seeded BMI088
+model converts known motion into independently timestamped accelerometer and gyro
+readings. The native firmware receives the sensor readings and normal operator
+commands. A separate comparator checks its observable pose and twist throughout
+the one-second tracking window against the closed-form reference at source time.
+The cases also check expiry and the expected response to stale data.
+
+| Peak absolute error | Limit |
+|---|---|
+| Planar position vector | 0.050 m |
+| Body velocity vector | 0.020 m/s |
+| Relative yaw | 2 degrees |
+| Yaw rate | 0.020 rad/s |
+
+Exit **0** means every planned case passed. Exit **1** means a measured product
+check failed. Exit **2** means the check could not complete, for example because
+the firmware could not build or expected observations were missing. The JSON
+counts preserve incomplete cases even when a measured failure sets the exit code.
+
+For a future release needing new independent cases, pin the firmware first, then
+choose additional profiles or seeds. Archive their inputs or generating source,
+seed, candidate identity and results for replay. Use confidential sealed
+qualification only when a particular study explicitly calls for blinded inputs
+and separate custody. The existing 144-case study has its own verdict. This
+public regression covers the simulated level-motion diagnostic. MCU timing,
+electrical behavior and physical IMU accuracy require other evidence.
+
 ## Prepare the run
 
 1. Record the release ID and included stories, date, host, toolchain versions, board profiles, protocol version, and revisions of firmware, virtual board, JavaScript/web client, Python and Arduino. Capture working-tree status for each. Keep a patch or equivalent source snapshot if testing uncommitted work.
@@ -52,7 +96,8 @@ For the v0.4 persistence cases, run `python -m unittest discover -s tests -p tes
 | DRV8870 sleep on original v0.3 and Nano, `i_3788e3c6057f` | Against protocol 2.17 run `python -m unittest discover -s tests -p test_drv8870_sleep.py -v`. Build each native image with `python tools/build_native.py --revision <revision> --out build/<revision>`, using `0.3.0` and `0.3.1`. | Verify the INIT identity, each regular timer channel and GPIO alternate function. Compare low/low timer coast with GPIO low/low on all eight inputs through sleep, reconnect and release. Confirm at least 2 ms of requested low dwell. On USB and I²C reject sleeping, queued and fragmented drive or brake with error 19. Fresh drive or short brake must affect only the addressed motor or platform wheels. Coast must return both inputs low. Record the simulator build IDs alongside results. Physical waveforms, electrical savings and first-drive latency need bench measurements. |
 | Board idle (v0.4), `i_153acabd4598` | Run `python -m unittest discover -s tests -p test_board_idle.py -v` on protocol 2.16. Then run `python tests/test_board_idle.py --measure` and retain its JSON output with the build manifest. | Verify entry and exit with both prior driver policies, failed transitions and retry, reconnect, heartbeat expiry, time sync, queued commands, fresh telemetry, encoder continuity and v0.3 rejection. Compare one second with four initialized sleeping drivers, temperature and IMU subscriptions at 250 ms, and 20 PING plus 20 POLL commands in each mode. Require 40 ACKs in each, positive sensor reads and events at baseline, zero periodic reads and events in idle. Hardware power, interrupt behavior and wake latency need separate bench evidence. |
 | Shallow board idle on original v0.3 and Nano, `i_df295fb22ad4` | On protocol 2.18 run `python -m unittest discover -s tests -p test_drv8870_idle.py -v`. In the same firmware checkout run `python test/test_usb_vbus/run_tests.py` and `python test/test_configuration/run_tests.py`. Retain both logs, manifests and firmware source revision or fingerprint. Use the 2.17 checkout to check the earlier unsupported contract. | Enter from active motor and platform control. Confirm idle on the same initialized USB session, exchange PING and clock status, and retain the configured clock interval after explicit exit. Check both prior driver policies, repeated commands, failed entry/exit and retry, and blocked USB and I2C queues with fragmented commands straddling wake. All eight modeled inputs stay low on successful exit until fresh actuation. Check Nano motor code never touches PA9 and that the firmware Nano fixture retains USB attachment through idle and handles a subsequent VBUS loss and renewed handshake. |
-| Fused and IMU-only tracking · `i_9d6028c11aa8`, `i_03fc803954c7` | Replay identical timestamped stationary, straight, turning and slip trajectories for encoder-only, IMU-only and fused modes. Inject IMU bias and sample loss. Compare estimates and closed-loop response against an independent reference trajectory available only to the scorer. | Report pose and velocity errors, stationary drift, latency and control tracking against the agreed story limits for each mode. Record fixture, units and observation window. If limits are open, retain measurements and leave acceptance pending. |
+| IMU-only tracking · `i_03fc803954c7` | Run the [public IMU regression](#public-imu-regression) against the candidate. | Record its seed, native build ID, peak pose and velocity errors, and all six outcomes. |
+| Encoder and fused tracking · `i_9d6028c11aa8` | Replay matched stationary, straight, turning and slip trajectories for encoder-only and fused modes. Inject IMU bias and sample loss. Compare estimates and closed-loop response against independent reference motion. | Report pose and velocity errors, stationary drift, latency and control tracking against each mode's story limits. Record fixture, units and observation window. |
 | Tracking source selection · `i_0c388c609d20` | Select each supported mode. Switch with fresh and missing sensor data, then reconnect and reset. Exercise unsupported-board behavior. | Requested and active modes, transition behavior and fallback/error match the approved contract. Invalid or stale estimates are observable. |
 | Custom platform geometry · `i_46691a2bffb0` | Compare editable presets with equivalent custom definitions. Supply an independent non-preset layout with a passive encoder wheel. Exercise unsupported motion and degenerate geometry. | Match wheel order, signs, motion constraints and expected targets computed independently from the input geometry. Passive wheels receive no drive target. |
 | Platform diagrams · `i_f485c1a25fbb` | Using only the diagram and worked example, configure differential, three-wheel omni, four-wheel mecanum and custom layouts in the web client. Compare the values shown in documentation, entered in the client and read back from the virtual board. | Units, distance endpoints, angle references, handedness, motor/encoder indices and direction agree. Capture each diagram and its completed form. |
