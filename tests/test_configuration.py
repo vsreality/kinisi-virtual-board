@@ -1,5 +1,7 @@
 """Production save/journal/restore through wire commands and fresh C runtimes."""
+import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import struct
@@ -16,6 +18,7 @@ from kinisi_virtual_board.firmware_build import DEFAULT_FIRMWARE
 from test_board import frames
 
 FIRMWARE = Path(os.environ.get("KINISI_FIRMWARE", DEFAULT_FIRMWARE))
+LEGACY_IMAGES = Path(__file__).parent / "fixtures" / "configuration-v1"
 
 
 class Session:
@@ -72,6 +75,89 @@ class Session:
 
 
 class ConfigurationTests(unittest.TestCase):
+    def test_legacy_factory_and_saved_setup(self):
+        expected = [3, .12, .48, .31, 4096, 2000, 2000, 2000, 1, 1, 1, 0, 1, 0, 1, 0, 25000]
+        images = {
+            "factory": "7d2c7ac4888bfd75cd5f56e8d61f69595121183afc81556c876732fd3782c62f",
+            "mecanum": "d492e8f032c427407fb232d459b65d0fa23d13ffebef2c7026764bc4de66231e",
+        }
+        for preset, digest in images.items():
+            image = (LEGACY_IMAGES / f"{preset}.fram").read_bytes()
+            self.assertEqual(hashlib.sha256(image).hexdigest(), digest)
+            with self.subTest(preset=preset), FirmwareBoard(
+                firmware=FIRMWARE, fram_image=image
+            ) as board:
+                self.assertFalse(board.ready)
+                self.assertEqual(board.motor_pwm, (0.,) * 4)
+                for connection in ("boot", "reconnect"):
+                    if connection == "reconnect":
+                        board.disconnect()
+                        self.assertFalse(board.ready)
+                    session = Session(board)
+                    session.initialize()
+                    if board.schema.version >= (2, 19, 0):
+                        self.assertEqual(struct.unpack("<Bd", session.ok("GET_FUSION_CONFIGURATION")), (0, 0.))
+                    if board.schema.version >= (2, 20, 0):
+                        self.assertEqual(session.ok("GET_IMU_TRACKING_STATUS")[0], 0)  # STOPPED
+                    if preset == "factory":
+                        self.assertEqual(session.field(0), 0)
+                        self.assertEqual(struct.unpack("<I", session.ok("GET_PWM_FREQUENCY"))[0], 100000)
+                        session.error("GET_CONFIGURATION_FIELD", "PLATFORM_NOT_INITIALIZED", field=1)
+                        session.error("SET_PLATFORM_TARGET_VELOCITY", "PLATFORM_NOT_INITIALIZED", x=.1)
+                    else:
+                        self.assertEqual(session.snapshot(), expected)
+                        session.error("SET_PLATFORM_TARGET_VELOCITY", "CONTROLLER_NOT_INITIALIZED", x=.1)
+                    session.error("GET_PLATFORM_ODOMETRY", "ODOMETRY_NOT_INITIALIZED")
+                    board.advance(.1)
+                    self.assertEqual(board.motor_pwm, (0.,) * 4)
+
+    def test_legacy_mecanum_tracks_encoders_and_disconnect_stops_pwm(self):
+        board, session = self.board(fram_image=(LEGACY_IMAGES / "mecanum.fram").read_bytes())
+        board.set_imu(status=1)
+        session.error("GET_IMU", "SENSOR_NOT_AVAILABLE")
+        session.ok("SET_CONTROLLER_FREQUENCY", frequency=100)
+        session.ok("START_PLATFORM_CONTROLLER", kp=10, ki=20, kd=0, integral_limit=100)
+        session.ok("SET_ODOMETRY_FREQUENCY", frequency=50)
+        session.ok("START_PLATFORM_ODOMETRY")
+        session.ok("SET_PLATFORM_TARGET_VELOCITY", x=.1)
+        board.advance(.24)
+        self.assertTrue(any(board.motor_pwm))
+        # Yaw is additive across odometry ticks. Apply the saved channel directions
+        # and scales to independently observed, wrapping encoder registers.
+        ticks = [n if n < 32768 else n - 65536 for n in board.encoder_counts]
+        wheel = [n * math.tau * sign / scale for n, sign, scale in
+                 zip(ticks, (-1, -1, -1, 1), (4096, 2000, 2000, 2000))]
+        yaw = .06 * (wheel[0] + wheel[1] - wheel[2] - wheel[3]) / (2 * (.48 + .31))
+        pose = session.ok("GET_PLATFORM_ODOMETRY")
+        stamp, _, _, x, y, heading = struct.unpack("<QBB3d", pose)
+        self.assertEqual(stamp, board.now_us)
+        self.assertGreater(math.hypot(x, y), .001)
+        self.assertGreater(abs(yaw), .001)
+        self.assertAlmostEqual(heading, yaw, places=10)
+        board.disconnect()
+        self.assertFalse(board.ready)
+        self.assertEqual(board.motor_pwm, (0.,) * 4)
+        session = Session(board)
+        session.initialize()
+        self.assertEqual(session.ok("GET_PLATFORM_ODOMETRY"), pose)
+        board.advance(.2)
+        self.assertEqual(board.motor_pwm, (0.,) * 4)
+
+    def test_legacy_image_on_unsupported_boards(self):
+        image = (LEGACY_IMAGES / "mecanum.fram").read_bytes()
+        for revision in ("0.3.0", "0.3.1"):
+            with self.subTest(revision=revision):
+                board, session = self.board(revision=revision, fram_image=image)
+                session.error("GET_CONFIGURATION_FIELD", "SENSOR_NOT_AVAILABLE", field=0)
+                session.error("SAVE_CONFIGURATION", "SENSOR_NOT_AVAILABLE")
+                if board.schema.version >= (2, 19, 0):
+                    session.error("GET_FUSION_CONFIGURATION", "SENSOR_NOT_AVAILABLE")
+                if board.schema.version >= (2, 20, 0):
+                    session.error("GET_IMU_TRACKING_STATUS", "SENSOR_NOT_AVAILABLE")
+                self.assertEqual(board.fram_transactions, (0, 0))
+                self.assertEqual(board.fram_image, image)
+                self.assertEqual(board.motor_pwm, (0.,) * 4)
+
     def board(self, **kwargs):
         board = FirmwareBoard(firmware=FIRMWARE, **kwargs)
         self.addCleanup(board.close)

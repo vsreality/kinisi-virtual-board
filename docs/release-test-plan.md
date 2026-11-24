@@ -119,6 +119,8 @@ Execute each case when its story implementation is available. Record the concret
 
 For the v0.4 persistence cases, run `python -m unittest discover -s tests -p test_configuration.py -v` from this repository. Check the individual case names and count, including the separate-process cold boot. An empty discovery run gives no evidence. Complete the SDK and web-client workflows as well.
 
+For tracking-source migration (`i_0c388c609d20`), run those configuration tests with the candidate firmware and the [retained v1 FRAM images](../tests/fixtures/configuration-v1/README.md). They cover erased storage, a released mecanum preset, default encoder odometry, reconnect during motion, and unsupported v0.3 and Nano responses.
+
 | Case and Agora item | Procedure | Expected result |
 | --- | --- | --- |
 | Save and restore on v0.4 · `i_0c637931409e` | Start with blank FRAM. Configure setup A with known geometry, encoder resolution, direction flags and a supported nondefault PWM frequency. Save. Change settings to B without saving, disconnect and reconnect to the same running board, then cold-boot with A's FRAM. Repeat after explicitly saving B. Exercise Save from the web client and SDKs. | Blank boot allows manual setup. Reconnect shows B. First cold boot restores A, second restores B, without host reinitialization. Match fields through readback, including `GET_PWM_FREQUENCY`. Outputs remain stopped until a fresh motion command. |
