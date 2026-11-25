@@ -20,3 +20,5 @@ include = ["kinisi_virtual_board*"]
 
 [tool.setuptools.package-data]
 kinisi_virtual_board = ["firmware_support/*.c", "firmware_support/*.h"]
+
+"kinisi_virtual_board.feedback_selector" = ["fixtures/*.fram"]

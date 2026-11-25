@@ -36,7 +36,20 @@ def main():
     source = qualification.add_mutually_exclusive_group()
     source.add_argument("--motion-firmware", type=Path, help="Independent native motion producer checkout (defaults to --firmware)")
     source.add_argument("--replay", type=Path, help="Replay an archived run's plan and original motion sources")
+    selector = commands.add_parser("selector-regression", help="Run eight public native feedback source selector scenarios")
+    selector.add_argument("--firmware", type=Path, required=True, help="Clean firmware source checkout to test")
+    selector.add_argument("--out", type=Path, required=True, help="New output directory for raw packets and SDK examples")
+    selector.add_argument("--compiler", default=argparse.SUPPRESS, help="Host GCC/Clang executable (or set CC)")
+    from .feedback_selector.runner import CASES
+    selector.add_argument("--case", choices=CASES, action="append", dest="cases", help="Run only this case; repeat to select several")
+    selector.add_argument("--development", action="store_true", help="Allow and fingerprint uncommitted firmware/simulator changes")
     args = parser.parse_args()
+    if args.command == "selector-regression":
+        from .feedback_selector.runner import run
+        try:
+            return run(args)
+        except (OSError, ValueError, RuntimeError) as error:
+            parser.exit(2, f"Selector regression incomplete: {error}\n")
     if args.command == "imu-qualify":
         from .imu_qualification import execute
         try:

@@ -2,6 +2,89 @@
 
 Use this plan for each controller firmware release. Run the common checks on each candidate, then the cases for its Agora stories. When a story becomes supported, keep its automated regression in subsequent releases. The current release is `r_e71aea9bb26d`. Use virtual v0.4.0 for the common suite and the original v0.3.0 and Nano v0.3.1 images for their profile-specific cases. Physical qualification is deferred for this run.
 
+## Feedback source selector regression
+
+From a clean simulator Git checkout, supply a clean firmware Git checkout with
+the feedback selector commands and run:
+
+```sh
+python -m kinisi_virtual_board selector-regression --firmware /path/to/firmware --out build/selector-run
+```
+
+Use Python 3.10+, Git and a host GCC or Clang on Windows or Linux. Windows can use
+MSYS2 UCRT64 GCC. Select another compiler with `--compiler PATH` or `CC`. The
+native in-process regression requires no COM driver, SDK installation, MSVC,
+administrator access or browser. Firmware and simulator repositories can live
+anywhere; neither a shared workspace layout nor a mutable staging checkout is
+required. The firmware must include its required source dependencies. The output directory can be inside the simulator checkout (for example
+`--out results/selector`) or elsewhere. Only that newly created output tree is
+excluded from the closing source-identity check; all other tracked and untracked
+source changes remain guarded. Existing output is never overwritten.
+
+The command runs these retained public cases without drawing new schedules:
+
+| Case | Required observations |
+| --- | --- |
+| `factory` | Released factory v1 FRAM boots safely with encoder default. |
+| `migration` | Released mecanum v1 geometry survives migration; selected source persists, transient tracking/mount confirmation does not; failed saves retain the committed record. |
+| `v03`, `nano` | Unsupported source/persistence operations reject without storage changes or motion. |
+| `encoder` | Selected pose/twist match native wheel odometry, have a fresh origin and coherent capture keys, and preserve reconnect behavior. |
+| `switch_safety` | Same-source selection is a no-op. Armed, moving and coasting switches are refused; a real switch requires disarmed and quiet state, never arms, and rejects old capture keys. New encoder origin waits for a publication after the switch, including 1 Hz and 7 Hz odometry. |
+| `imu` | Selected vectors match the native IMU producer; confirmation, expiry, frozen input, explicit restart and no silent encoder fallback are observable. |
+| `fused` | Passive fusion requires mounting confirmation; vectors match an independent native release-producer instance under the same sensor input; loss and recovery remain visible. |
+
+The two packaged v1 FRAM images are byte-identical to the documented
+[public pre-selector fixtures](../tests/fixtures/configuration-v1/README.md).
+The IMU cases retain public seed 131 and a 10 ms delivery delay. They drive
+modeled sensor readings and external encoder counters, never estimator state.
+The fused comparison uses a second native instance; it establishes protocol and
+producer consistency, not independent localization accuracy. The IMU/fused
+telemetry scenarios require zero motor PWM throughout. Encoder and switch
+scenarios intentionally exercise motion and verify stopping separately.
+
+`summary.json` records simulator and firmware revisions, harness/fixture hashes,
+each outcome and the SHA-256 of its raw `<case>.jsonl`. Boot records include native
+build manifests, board identity and FRAM hashes. Wire records preserve request
+and reply bytes, virtual time, encoder counters and PWM. A full successful run
+also writes `sdk-records.json`: coherent encoder, IMU and fused snapshots plus
+an expired IMU status, in raw payload form for SDK tests. The exporter verifies
+capture hashes and schema identities before extracting examples. These records
+are examples to replay in SDK tests, not proof that a specific SDK was tested.
+
+Exit 0 means every selected scenario and required export passed. Exit 1 retains
+a failed or incomplete scenario/export. Exit 2 means setup or input-integrity
+verification could not complete. Exceptions and partial raw logs remain in the
+new output directory. `--case NAME` can be repeated for focused checks; a subset
+is not evidence for all eight cases. Packet export requires passing `encoder`,
+`imu` and `fused` cases. `--development` explicitly permits and fingerprints dirty
+source checkouts; use clean pinned checkouts for release evidence. Python `-O`
+is rejected because scenario assertions are part of the checks.
+
+The separately verified optional browser path uses the production
+`kinisi-serial-proxy` with its serial opening bound to the simulator's
+`VirtualSerial`, entirely over loopback. It requires Python `pyserial` and
+`websockets`, the matching built JavaScript SDK/web client (Node/npm for its
+build), and Edge. Automated UI checks additionally require Python Playwright
+and its Edge channel. This loopback path needs no Windows COM driver. It uses
+the web client's **Remote proxy**, lists the simulated port and connects it.
+
+That integration harness is currently the workspace-only
+`releases/feedback-source-selector/board-demo/web_session.py`, alongside the
+retained browser evidence; it is not shipped by this simulator repository and
+is not run by `selector-regression`. In that workspace its entry points are
+`python web_session.py --firmware PATH --site BUILT_SITE` and the same command
+with `--check NEW_OUTPUT` for automated checks. The workspace must provide the
+proxy checkout and the harness's documented layout. The portable native core
+above has none of those dependencies. A separate direct Web Serial workflow
+uses a PTY or the installed Windows COM driver and is not the verified loopback
+browser path described here.
+
+For browser acceptance record the exact served JS bundle and SDK/firmware pins,
+UI actions, acknowledged wire writes, status readback and PWM. Exercise source
+selections, IMU setup, fused mount confirmation and expiry. Keep browser
+acceptance distinct from native and exported-packet checks, and keep large run
+artifacts outside Git.
+
 ## Public IMU regression
 
 For ordinary v0.4 IMU development and release checks, run one command from the

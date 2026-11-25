@@ -55,6 +55,16 @@ For the full 144-case chassis qualification run
 It saves its public plan, sensor inputs and results automatically.
 [Qualification matrix and replay](docs/release-test-plan.md#full-public-imu-release-qualification)
 
+Run the eight native feedback source selector scenarios and export SDK packet
+examples with a clean candidate checkout:
+
+```sh
+python -m kinisi_virtual_board selector-regression --firmware ../kinisi-motor-controller-firmware --out build/selector-run
+```
+
+This covers migration, all three sources, switching, stale data and unsupported
+boards. [Selector cases, receipts and optional browser checks](docs/release-test-plan.md#feedback-source-selector-regression)
+
 Use the [controller firmware release test plan](docs/release-test-plan.md) for
 candidate builds, virtual-board regression, story checks and release evidence.
 
