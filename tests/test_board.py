@@ -394,7 +394,9 @@ class BoardTests(unittest.TestCase):
                                       "SET_BOARD_IDLE", "GET_BOARD_IDLE", "SET_FUSION_EXPERIMENT",
                                       "GET_FUSION_STATUS", "GET_FUSION_VECTOR", "GET_FUSION_CONFIGURATION",
                                       "SET_IMU_TRACKING", "GET_IMU_TRACKING_STATUS", "GET_IMU_TRACKING_VECTOR",
-                                      "GET_IMU_TRACKING_CONFIGURATION")
+                                      "GET_IMU_TRACKING_CONFIGURATION", "SET_FEEDBACK_SOURCE",
+                                      "GET_FEEDBACK_SOURCE_STATUS", "GET_FEEDBACK_SOURCE_VECTOR",
+                                      "SET_FEEDBACK_FUSION_MOUNT", "GET_FEEDBACK_FUSION_MOUNT")
                      if name in self.board.schema.commands]
         self.assertEqual(self.board.unsupported_commands, sorted(expected))
 
