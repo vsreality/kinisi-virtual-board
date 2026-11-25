@@ -38,6 +38,8 @@ The current driver targets Windows 11 x64.
 
 ## Test
 
+Run the [dual-source tracking health qualification](docs/release-test-plan.md#dual-source-tracking-health) to check how v0.4 reports encoder and IMU failures, persistent disagreement and recovery.
+
 For paired encoder and IMU fusion control tests, use the [six-arm native firmware comparison](tools/fusion_comparison/README.md). It takes explicit reference and candidate firmware checkouts and a public workload.
 
 From this checkout, run the public v0.4 IMU motion regression with Python 3.10+

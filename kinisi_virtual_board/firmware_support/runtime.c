@@ -9,6 +9,11 @@
 #if BOARD_HAS_BOARD_IDLE
 #include "wake_barriers.h"
 #endif
+#if BOARD_HAS_FEEDBACK_SOURCE_HEALTH && __has_include("feedback_health_internal.h")
+#define SIM_TRACKING_HEALTH 1
+#include "feedback_source.h"
+static uint64_t next_health_poll;
+#endif
 #include "hw_clock.h"
 #include "hw_gpio.h"
 #include "hw_temperature.h"
@@ -62,6 +67,9 @@ static int runtime_error;
 static double pwm[4], resolutions[4], temperature = 25., currents[4];
 static uint16_t counts[4];
 static uint8_t motor_ready[4], motor_reverse[4], motor_mode[4];
+/* Disabled quadrature timer: register holds its last count until re-enabled. */
+static uint8_t timer_disabled[4];
+static uint16_t previous_shaft_count[4];
 static uint8_t encoder_ready[4], encoder_reverse[4], pins[10], led;
 static hw_imu_sample_t imu = {.acceleration_z = 9.80665};
 static uint64_t imu_accel_us, imu_gyro_us;
@@ -274,6 +282,19 @@ API hw_imu_status_t hw_imu_read_observation(uint8_t index, hw_imu_sample_t *samp
     *gyro_us = imu_gyro_us;
     return HW_IMU_OK;
 }
+#ifdef SIM_TRACKING_HEALTH
+static bool encoder_sampling_valid(uint8_t index) {
+    return index < 4 && encoder_ready[index] && !timer_disabled[index];
+}
+static hw_imu_status_t read_health(uint8_t index, hw_imu_sample_t *sample,
+                                   uint64_t *accel_us, uint64_t *gyro_us) {
+    hw_imu_status_t status = hw_imu_read_observation(index, sample, accel_us, gyro_us);
+    /* The non-consuming monitor can see separate die times before both are ready. */
+    *accel_us = imu_accel_us;
+    *gyro_us = imu_gyro_us;
+    return status;
+}
+#endif
 hw_current_sense_status_t hw_current_sense_read(uint8_t i, double *value) {
 #if NUMBER_CURRENT_SENSORS == 0
     return HW_CURRENT_SENSE_UNAVAILABLE;
@@ -339,6 +360,9 @@ bool sim_usb_send(uint8_t *data, uint8_t length) {
 API void sim_init(void) {
     bmi088_init(&imu_model, imu_seed, imu_temperature_c);
     imu_started = true;
+#ifdef SIM_TRACKING_HEALTH
+    feedback_health_install(read_health, encoder_sampling_valid);
+#endif
     if (!fram_loaded) { memset(fram, 0xff, sizeof(fram)); fram_loaded = true; }
 #ifdef SIM_DRIVER_HAL
     hw_motor_init();
@@ -397,6 +421,13 @@ API int sim_poll(uint64_t time_us) {
         imu_accel_us = imu_model.accel_us;
         imu_gyro_us = imu_model.gyro_us;
     }
+#ifdef SIM_TRACKING_HEALTH
+    if (now_us >= next_health_poll) {
+        bool asleep = hw_motor_drivers_sleeping();
+        if (!asleep) feedback_health_poll();
+        next_health_poll = now_us + (asleep ? 20000 : 2000);
+    }
+#endif
 #ifdef SIM_DUAL_TRANSPORT
     sim_transport_expire();
     run_tasks();
@@ -445,7 +476,11 @@ API size_t sim_read(uint8_t *data, size_t capacity) {
     memcpy(data, tx, length); tx_size -= length; memmove(tx, tx + length, tx_size); return length;
 }
 API uint64_t sim_deadline(void) {
+#ifdef SIM_TRACKING_HEALTH
+    uint64_t next = next_health_poll;
+#else
     uint64_t next = UINT64_MAX;
+#endif
     for (unsigned i = 0; i < task_count; ++i)
         if (tasks[i].due < next) next = tasks[i].due;
     return next;
@@ -473,7 +508,14 @@ API int sim_lost(void) { return session.lost; }
 API int sim_ready(void) { return session.ready_announced; }
 #endif
 API void sim_drop(uint8_t command, unsigned count) { dropped[command] = count; }
-API void sim_encoder(uint8_t index, uint16_t value) { if (index < 4) counts[index] = value; }
+API void sim_encoder_sampling(uint8_t index, int enabled) {
+    if (index < 4) timer_disabled[index] = !enabled;
+}
+API void sim_encoder(uint8_t index, uint16_t value) {
+    if (index >= 4) return;
+    if (!timer_disabled[index]) counts[index] += (uint16_t)(value - previous_shaft_count[index]);
+    previous_shaft_count[index] = value;
+}
 API uint16_t sim_encoder_count(uint8_t i) { return i < 4 ? counts[i] : 0; }
 API void sim_shaft_velocity(const double *values) { memcpy(shaft_velocity, values, sizeof(shaft_velocity)); }
 API double sim_resolution(uint8_t i) { return i < 4 ? resolutions[i] : 0; }

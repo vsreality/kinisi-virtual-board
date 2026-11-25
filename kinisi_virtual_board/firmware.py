@@ -85,6 +85,7 @@ class FirmwareBoard:
             "disconnect": (None, ()), "lost": (ct.c_int, ()), "ready": (ct.c_int, ()),
             "drop": (None, (ct.c_uint8, ct.c_uint)), "encoder": (None, (ct.c_uint8, ct.c_uint16)),
             "controller_dispatches": (ct.c_uint64, ()),
+            "encoder_sampling": (None, (ct.c_uint8, ct.c_int)),
             "encoder_count": (ct.c_uint16, (ct.c_uint8,)),
             "shaft_velocity": (None, (ct.POINTER(ct.c_double),)),
             "pwm": (ct.c_double, (ct.c_uint8,)), "resolution": (ct.c_double, (ct.c_uint8,)),
@@ -342,6 +343,13 @@ class FirmwareBoard:
         with self._lock:
             self._check_open()
             self._lib.sim_drop(self.schema.code(command), count)
+
+    def set_encoder_sampling(self, index, enabled):
+        """Enable or disable the simulated quadrature timer, retaining its counter."""
+        self._index(index)
+        with self._lock:
+            self._check_open()
+            self._lib.sim_encoder_sampling(index, bool(enabled))
 
     def set_temperature(self, celsius=25., *, status=0):
         with self._lock:

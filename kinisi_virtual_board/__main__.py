@@ -43,7 +43,17 @@ def main():
     from .feedback_selector.runner import CASES
     selector.add_argument("--case", choices=CASES, action="append", dest="cases", help="Run only this case; repeat to select several")
     selector.add_argument("--development", action="store_true", help="Allow and fingerprint uncommitted firmware/simulator changes")
+    health = commands.add_parser("tracking-health", help="Qualify native v0.4 dual-source tracking health")
+    health.add_argument("--firmware", type=Path, required=True)
+    health.add_argument("--out", type=Path, required=True, help="New directory for the summary and wire traces")
+    health.add_argument("--compiler", default=argparse.SUPPRESS, help="Host GCC/Clang executable (or set CC)")
     args = parser.parse_args()
+    if args.command == "tracking-health":
+        from .feedback_selector.health import run
+        try:
+            return run(args)
+        except (OSError, ValueError, RuntimeError) as error:
+            parser.exit(2, f"Tracking health qualification incomplete: {error}\n")
     if args.command == "selector-regression":
         from .feedback_selector.runner import run
         try:

@@ -27,7 +27,7 @@ class Stimulus:
                    encoders="external unpowered wheel rotation, counter boundary only")
 
     def step(self, *, accel=(0., 0., 9.80665), gyro=(0., 0., 0.),
-             counts=(0., 0., 0., 0.), deliver=True):
+             counts=(0., 0., 0., 0.), deliver=True, require_coast=True):
         at = self.sessions[0].board.now_us + 2500
         self.model.advance(at, accel, gyro)
         stamps = (self.model.accel_us, self.model.gyro_us)
@@ -42,7 +42,8 @@ class Stimulus:
                 s.board._counts[i] += increment
             s.board.advance(.0025)
             assert s.board.now_us == at
-            assert not any(s.board.motor_pwm), "Telemetry unexpectedly drove a motor"
+            if require_coast:
+                assert not any(s.board.motor_pwm), "Telemetry unexpectedly drove a motor"
         due = [row for row in self.pending if row[0] <= at]
         self.pending = [row for row in self.pending if row[0] > at]
         for _, die, stamp, values in due:

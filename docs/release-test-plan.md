@@ -93,7 +93,22 @@ Use the same native simulator to run default, encoder-feedback and fused-feedbac
 python -B tools/fusion_comparison run --reference /path/to/reference-firmware --candidate /path/to/candidate-firmware --spec tools/fusion_comparison/development.json --out /path/to/new-comparison
 ```
 
-The six original nominal dispersion values ship with the scorer. Each result includes paired tracking errors, source health, control comparisons and endpoint diagnostics. Keep each failed or incomplete run and use the supplied `score` command to replay saved traces. A subset can check installation and transport. Full development results and a separately specified release qualification have different evidence requirements. The tool consumes an explicit workload file and generates no new seed draw. See the [fusion comparison guide](../tools/fusion_comparison/README.md) for inputs, scope and exit codes.
+This command replays historical tracking measurements and their original numerical verdicts. The current release criterion is communication of source health and disagreement. Use the native matrix below for that decision.
+
+### Dual-source tracking health
+
+From the simulator root, pass a clean v0.4 firmware checkout with the protocol 2.22 health commands and a new output directory. The regular user account needs Python and a host GCC or Clang compiler. The command works offline. If the compiler is outside PATH, append `--compiler /path/to/gcc`.
+
+```sh
+python -B -m kinisi_virtual_board tracking-health --firmware /path/to/firmware --out /path/to/results/health-01
+```
+
+The board runs native firmware. A public BMI088 model (seed 131) and externally imposed wheel counts exercise differential, omni and mecanum motion. `summary.json` identifies the two source checkouts, the workload, observed outcomes and failures. Each JSONL trace retains the wire bytes, board time, sensor inputs, shaft counts and motor outputs. Run the same command with a new output directory to repeat. Exit codes are 0 for pass, 1 for an observed failure and 2 for incomplete evidence or setup error.
+
+Inspect encoder, IMU and fused status alongside the selected estimate. The cases exercise aligned straight travel and turns, an IMU I/O error, stale data, saturation, disabled encoder odometry, a brief yaw discrepancy, persistent conflicting counts, and recovery. Level constant-speed translation and rest can produce identical inertial signals. A stationary counter alone cannot identify a broken encoder. The motion interlock case drives an explicit target, verifies coasting before any diagnostic read, and requires a new target after recovery. A separate case checks physical IMU availability when its one-second tracking estimate expires. Older board profiles exercise the native unsupported responses.
+
+For an integrated release, replay the captured health packets through the matching JavaScript, Python and Arduino SDKs and verify the operator's live browser readout. The native command requires only the simulator and firmware repositories. The browser path additionally requires a built matching web client, the local serial proxy, and a browser. Record the client revisions alongside the native run. Hardware measurements stay separate.
+
 
 ## Public IMU regression
 
