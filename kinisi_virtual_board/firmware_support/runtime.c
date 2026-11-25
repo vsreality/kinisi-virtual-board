@@ -28,6 +28,7 @@ static uint64_t next_health_poll;
 #endif
 #include "cmsis_os.h"
 #include "semphr.h"
+#include <limits.h>
 #include <math.h>
 #include <setjmp.h>
 #include <string.h>
@@ -52,15 +53,18 @@ static uint8_t rx[65536];
 static size_t rx_size;
 #ifdef SIM_DRIVER_HAL
 #ifdef SIM_ENCODER_INGRESS_FENCE
-static size_t bytes_before_encoder_ready[4];
-static uint8_t current_encoder_changes;
-static void fence_encoder_inputs(uint8_t changed) {
-    for (unsigned i = 0; i < 4; ++i) {
+/* Later firmware includes motor and chassis endpoints in the same fence. */
+typedef __typeof__(connection_before_encoder_ready()) encoder_barriers_t;
+enum { ENCODER_FENCE_BITS = sizeof(encoder_barriers_t) * CHAR_BIT - ENCODER_BARRIER_SHIFT };
+static size_t bytes_before_encoder_ready[ENCODER_FENCE_BITS];
+static encoder_barriers_t current_encoder_changes;
+static void fence_encoder_inputs(encoder_barriers_t changed) {
+    for (unsigned i = 0; i < ENCODER_FENCE_BITS; ++i) {
         if (changed & (1u << i)) bytes_before_encoder_ready[i] = rx_size;
     }
     current_encoder_changes |= changed;
 }
-static uint8_t changed_during_dispatch(void) { return current_encoder_changes; }
+static encoder_barriers_t changed_during_dispatch(void) { return current_encoder_changes; }
 #endif
 static size_t bytes_before_wake;
 static bool consume_mark(size_t *marked, size_t frame_size) {
@@ -468,14 +472,14 @@ API int sim_poll(uint64_t time_us) {
                 bool before_driver_wake = consume_mark(&bytes_before_wake, size);
 #if BOARD_HAS_BOARD_IDLE
                 bool was_idle = connection_board_idle();
-                uint8_t stale = before_driver_wake ? BEFORE_DRIVER_WAKE : 0;
+                uint16_t stale = before_driver_wake ? BEFORE_DRIVER_WAKE : 0;
                 if (consume_mark(&bytes_before_board_wake, size)) stale |= BEFORE_BOARD_WAKE;
 #else
                 bool stale = before_driver_wake;
 #endif
 #ifdef SIM_ENCODER_INGRESS_FENCE
                 current_encoder_changes = 0;
-                for (unsigned i = 0; i < 4; ++i) {
+                for (unsigned i = 0; i < ENCODER_FENCE_BITS; ++i) {
                     if (consume_mark(&bytes_before_encoder_ready[i], size))
                         stale |= 1u << (ENCODER_BARRIER_SHIFT + i);
                 }

@@ -39,6 +39,7 @@ CASES = (
     "reconnect",
     "live_target_fault",
     "live_encoder_fault",
+    "encoder_reassignment",
     "finite_imu",
     "v03",
     "nano",
@@ -464,7 +465,50 @@ def active_fault(session, stim, case):
     )
 
 
+def encoder_reassignment(session):
+    """A target already in the receive queue belongs to the old motor binding."""
+    setup_command = "INITIALIZE_MOTOR_CONTROLLER"
+    target_command = "SET_MOTOR_TARGET_SPEED"
+    motor = dict(motor_index=3, encoder_resolution=CPR, kp=8, ki=0, kd=0, integral_limit=100)
+    target = dict(motor_index=3, speed=2)
+    session.ask("SET_CONTROLLER_FREQUENCY", frequency=100)
+    session.ask(setup_command, encoder_index=3, **motor)
+    session.ask(target_command, **target)
+    session.board.advance(.02)
+    session.mark("old_binding_driving")
+    require(session.board.motor_pwm[3] != 0, "Initial motor target did not actuate")
+    session.board.set_encoder_sampling(3, False)
+    session.board.advance(.02)
+    session.mark("old_shaft_lost")
+    require(not any(session.board.motor_pwm), "Lost encoder did not stop the motor")
+
+    # Both frames enter the native queue in one write, before the new binding ACK.
+    rebind = session.schema.request(setup_command, 60001, encoder_index=2, **motor)
+    old_target = session.schema.request(target_command, 60002, **target)
+    session.board.feed(rebind + old_target)
+    reply = session.board.drain()
+    session.mark("batched_rebind_and_old_target", tx=(rebind + old_target).hex(), rx=reply.hex())
+    rejected = bytes([session.schema.code(target_command), session.schema.errors["SAMPLE_NOT_AVAILABLE"]])
+    expected = session.schema.frame(setup_command, 60001) + session.schema.frame("ERROR", 60002, rejected)
+    require(reply == expected, f"Reassignment and queued target replies: {reply.hex()}")
+    for _ in range(2):
+        session.board.advance(.01)
+        session.mark("rebound_waiting_for_fresh_target")
+        require(not any(session.board.motor_pwm), "Rebound motor resumed a queued target")
+    session.ask(target_command, **target)
+    session.board.advance(.02)
+    fresh_pwm = session.board.motor_pwm[3]
+    session.mark("fresh_target_on_new_binding")
+    require(fresh_pwm != 0, "Fresh target on the healthy binding did not actuate")
+    session.board.disconnect()
+    session.mark("rebound_motor_disconnected")
+    require(not any(session.board.motor_pwm), "Disconnect failed to stop the rebound motor")
+    return dict(old_shaft=3, new_shaft=2, motor=3, fresh_pwm=fresh_pwm)
+
+
 def scenario(session, case):
+    if case == "encoder_reassignment":
+        return encoder_reassignment(session)
     if case in ("health_protocol", "v03", "nano"):
         require(
             "GET_FEEDBACK_SOURCE_HEALTH" in session.schema.commands

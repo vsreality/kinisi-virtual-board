@@ -109,6 +109,8 @@ Inspect encoder, IMU and fused status alongside the selected estimate. The cases
 
 For an integrated release, replay the captured health packets through the matching JavaScript, Python and Arduino SDKs and verify the operator's live browser readout. The native command requires only the simulator and firmware repositories. The browser path additionally requires a built matching web client, the local serial proxy, and a browser. Record the client revisions alongside the native run. Hardware measurements stay separate.
 
+Two cases exercise commands that crossed an encoder fault. A fragmented chassis START spans timer recovery. A standalone motor switches to a healthy encoder while a target is already buffered behind the reconfiguration request. Both stale requests must be rejected. The standalone motor must coast until a fresh target arrives on its new binding.
+
 
 ## Public IMU regression
 
