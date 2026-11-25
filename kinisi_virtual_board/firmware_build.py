@@ -102,6 +102,11 @@ def build_firmware(schema, firmware=DEFAULT_FIRMWARE, revision="0.4.0", compiler
     if "SAVE_CONFIGURATION" in schema.commands:
         sources += CONFIGURATION_SOURCES
         header += "#define SIM_CONFIGURATION_STORAGE 1\n"
+    # Earlier source-health candidates did not yet install per-shaft ingress fences.
+    feedback_header = firmware / "include/feedback_source.h"
+    if (revision == "0.4.0" and feedback_header.is_file()
+            and "feedback_install_encoder_fence(" in feedback_header.read_text(encoding="utf8")):
+        header += "#define SIM_ENCODER_INGRESS_FENCE 1\n"
     compiler = find_compiler(compiler)
     identity = subprocess.run([compiler, "--version"], check=True, capture_output=True, text=True).stdout.splitlines()[0]
     inputs = {p: (firmware / p).read_bytes() for p in sources}

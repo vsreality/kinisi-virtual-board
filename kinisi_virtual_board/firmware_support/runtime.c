@@ -51,6 +51,17 @@ static connection_t session;
 static uint8_t rx[65536];
 static size_t rx_size;
 #ifdef SIM_DRIVER_HAL
+#ifdef SIM_ENCODER_INGRESS_FENCE
+static size_t bytes_before_encoder_ready[4];
+static uint8_t current_encoder_changes;
+static void fence_encoder_inputs(uint8_t changed) {
+    for (unsigned i = 0; i < 4; ++i) {
+        if (changed & (1u << i)) bytes_before_encoder_ready[i] = rx_size;
+    }
+    current_encoder_changes |= changed;
+}
+static uint8_t changed_during_dispatch(void) { return current_encoder_changes; }
+#endif
 static size_t bytes_before_wake;
 static bool consume_mark(size_t *marked, size_t frame_size) {
     bool stale = *marked != 0;
@@ -342,6 +353,9 @@ static void stop_all(void) {
     rx_size = 0;
 #ifdef SIM_DRIVER_HAL
     bytes_before_wake = 0;
+#ifdef SIM_ENCODER_INGRESS_FENCE
+    memset(bytes_before_encoder_ready, 0, sizeof(bytes_before_encoder_ready));
+#endif
 #if BOARD_HAS_BOARD_IDLE
     bytes_before_board_wake = 0;
 #endif
@@ -362,6 +376,9 @@ API void sim_init(void) {
     imu_started = true;
 #ifdef SIM_TRACKING_HEALTH
     feedback_health_install(read_health, encoder_sampling_valid);
+#ifdef SIM_ENCODER_INGRESS_FENCE
+    feedback_install_encoder_fence(fence_encoder_inputs, changed_during_dispatch);
+#endif
     /* Cold boot can advance time before the first command or sim_poll call. */
     next_health_poll = now_us + 2000;
 #endif
@@ -456,6 +473,13 @@ API int sim_poll(uint64_t time_us) {
 #else
                 bool stale = before_driver_wake;
 #endif
+#ifdef SIM_ENCODER_INGRESS_FENCE
+                current_encoder_changes = 0;
+                for (unsigned i = 0; i < 4; ++i) {
+                    if (consume_mark(&bytes_before_encoder_ready[i], size))
+                        stale |= 1u << (ENCODER_BARRIER_SHIFT + i);
+                }
+#endif
                 bool was_asleep = hw_motor_drivers_sleeping();
                 connection_receive_queued(&session, request, size - 1, stale);
                 if (was_asleep && !hw_motor_drivers_sleeping()) bytes_before_wake = rx_size;
@@ -496,6 +520,9 @@ API void sim_disconnect(void) {
     rx_size = tx_size = 0;
 #ifdef SIM_DRIVER_HAL
     bytes_before_wake = 0;
+#ifdef SIM_ENCODER_INGRESS_FENCE
+    memset(bytes_before_encoder_ready, 0, sizeof(bytes_before_encoder_ready));
+#endif
 #if BOARD_HAS_BOARD_IDLE
     bytes_before_board_wake = 0;
 #endif

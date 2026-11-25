@@ -399,12 +399,39 @@ def active_fault(session, stim, case):
         and failed["flags"] & 13 == 4,
         f"Fault/target fence: {failed}",
     )
-    expected_rejection = (
-        "CONTROLLER_NOT_INITIALIZED" if timer_failure else "SAMPLE_NOT_AVAILABLE"
-    )
-    session.error("SET_PLATFORM_TARGET_VELOCITY", expected_rejection, **target)
     if timer_failure:
+        session.error(
+            "SET_PLATFORM_TARGET_VELOCITY", "CONTROLLER_NOT_INITIALIZED", **target
+        )
+        # A partial START received during loss cannot rearm after timer repair.
+        packet = session.schema.request(
+            "START_PLATFORM_CONTROLLER",
+            60000,
+            kp=10.0,
+            ki=20.0,
+            kd=0.0,
+            integral_limit=100.0,
+        )
+        session.board.feed(packet[:3])
+        session.mark("partial_start_before_repair", tx=packet[:3].hex())
         session.board.set_encoder_sampling(0, True)
+        stim.run(120000)
+        session.board.feed(packet[3:])
+        reply = session.board.drain()
+        session.mark("partial_start_after_repair", tx=packet[3:].hex(), rx=reply.hex())
+        expected = session.schema.frame(
+            "ERROR",
+            60000,
+            bytes(
+                [
+                    session.schema.code("START_PLATFORM_CONTROLLER"),
+                    session.schema.errors["SAMPLE_NOT_AVAILABLE"],
+                ]
+            ),
+        )
+        require(reply == expected, f"Command spanning encoder repair: {reply.hex()}")
+    else:
+        session.error("SET_PLATFORM_TARGET_VELOCITY", "SAMPLE_NOT_AVAILABLE", **target)
     stim.run(1800000)
     recovered = session.ask("GET_FUSION_STATUS")
     require(
@@ -414,7 +441,9 @@ def active_fault(session, stim, case):
         f"Target fence during recovery: {recovered}",
     )
     if timer_failure:
-        session.error("SET_PLATFORM_TARGET_VELOCITY", expected_rejection, **target)
+        session.error(
+            "SET_PLATFORM_TARGET_VELOCITY", "CONTROLLER_NOT_INITIALIZED", **target
+        )
         arm(session)
         stim.run(120000)
     session.ask("SET_PLATFORM_TARGET_VELOCITY", **target)
