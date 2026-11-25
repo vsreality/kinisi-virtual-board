@@ -1,0 +1,45 @@
+name: Controller CI
+
+on:
+  pull_request:
+  merge_group:
+    types: [checks_requested]
+
+permissions:
+  contents: read
+
+jobs:
+  native:
+    name: Controller unit tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: simulator
+    env:
+      KINISI_FIRMWARE: ${{ github.workspace }}/kinisi-motor-controller-firmware
+      KINISI_COMMANDS: ${{ github.workspace }}/kinisi-motor-controller-firmware/commands.json
+      KINISI_NATIVE_BINARY: ${{ github.workspace }}/simulator/build/native-linux/kinisi-sim
+      KINISI_REQUIRE_NATIVE: '1'
+    steps:
+      - name: Check out simulator
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          path: simulator
+          persist-credentials: false
+      - name: Check out compatible public firmware
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: szolotykh/kinisi-motor-controller-firmware
+          ref: 552c8b360bbcd86df13ecb02c406102dc7760177 # protocol 2.13
+          path: kinisi-motor-controller-firmware
+          persist-credentials: false
+      - name: Install the PTY test dependency
+        run: |
+          python3 -m venv "$RUNNER_TEMP/kinisi-venv"
+          "$RUNNER_TEMP/kinisi-venv/bin/python" -m pip install --only-binary=:all: --no-deps pyserial==3.5
+          echo "$RUNNER_TEMP/kinisi-venv/bin" >> "$GITHUB_PATH"
+      - name: Build native firmware and simulator and run C++ unit tests
+        run: python tools/build_native.py --firmware "$KINISI_FIRMWARE" --out build/native-linux
+      - name: Run protocol, firmware, endpoint and standalone tests
+        run: python tests/run_premerge.py
