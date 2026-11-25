@@ -396,7 +396,8 @@ class BoardTests(unittest.TestCase):
                                       "SET_IMU_TRACKING", "GET_IMU_TRACKING_STATUS", "GET_IMU_TRACKING_VECTOR",
                                       "GET_IMU_TRACKING_CONFIGURATION", "SET_FEEDBACK_SOURCE",
                                       "GET_FEEDBACK_SOURCE_STATUS", "GET_FEEDBACK_SOURCE_VECTOR",
-                                      "SET_FEEDBACK_FUSION_MOUNT", "GET_FEEDBACK_FUSION_MOUNT")
+                                      "SET_FEEDBACK_FUSION_MOUNT", "GET_FEEDBACK_FUSION_MOUNT",
+                                      "GET_FEEDBACK_SOURCE_HEALTH", "GET_FEEDBACK_IMU_CHANNELS")
                      if name in self.board.schema.commands]
         self.assertEqual(self.board.unsupported_commands, sorted(expected))
 

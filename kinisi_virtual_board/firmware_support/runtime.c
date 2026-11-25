@@ -362,6 +362,8 @@ API void sim_init(void) {
     imu_started = true;
 #ifdef SIM_TRACKING_HEALTH
     feedback_health_install(read_health, encoder_sampling_valid);
+    /* Cold boot can advance time before the first command or sim_poll call. */
+    next_health_poll = now_us + 2000;
 #endif
     if (!fram_loaded) { memset(fram, 0xff, sizeof(fram)); fram_loaded = true; }
 #ifdef SIM_DRIVER_HAL
