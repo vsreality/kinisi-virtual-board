@@ -38,6 +38,8 @@ The current driver targets Windows 11 x64.
 
 ## Test
 
+For paired encoder and IMU fusion control tests, use the [six-arm native firmware comparison](tools/fusion_comparison/README.md). It takes explicit reference and candidate firmware checkouts and a public workload.
+
 From this checkout, run the public v0.4 IMU motion regression with Python 3.10+
 and a host GCC or Clang compiler:
 

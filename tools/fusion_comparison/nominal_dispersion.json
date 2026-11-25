@@ -1,0 +1,49 @@
+{
+  "source_sha256": "a3270391e63c4fc4e29c58deae08932da2260c23e091ac588a88decbc4a72ce3",
+  "source": "Original public encoder baseline 90-case summary, 2026-11-21",
+  "derivation": "Select groups with surface=nominal; copy primary metric sample standard deviation and n without rounding.",
+  "entries": [
+    {
+      "preset": "differential",
+      "course": "velocity",
+      "metric": "tracking_linear_velocity_rmse_m_s",
+      "n": 5,
+      "sd": 0.0004540389086763381
+    },
+    {
+      "preset": "differential",
+      "course": "position",
+      "metric": "tracking_position_rmse_m",
+      "n": 5,
+      "sd": 0.0007743665614212325
+    },
+    {
+      "preset": "omni",
+      "course": "velocity",
+      "metric": "tracking_linear_velocity_rmse_m_s",
+      "n": 5,
+      "sd": 0.0004958283202182226
+    },
+    {
+      "preset": "omni",
+      "course": "position",
+      "metric": "tracking_position_rmse_m",
+      "n": 5,
+      "sd": 0.0004506004485814951
+    },
+    {
+      "preset": "mecanum",
+      "course": "velocity",
+      "metric": "tracking_linear_velocity_rmse_m_s",
+      "n": 5,
+      "sd": 0.0004926581005886071
+    },
+    {
+      "preset": "mecanum",
+      "course": "position",
+      "metric": "tracking_position_rmse_m",
+      "n": 5,
+      "sd": 0.00041914552169313726
+    }
+  ]
+}

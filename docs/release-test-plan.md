@@ -85,6 +85,16 @@ selections, IMU setup, fused mount confirmation and expiry. Keep browser
 acceptance distinct from native and exported-packet checks, and keep large run
 artifacts outside Git.
 
+## Matched encoder/IMU fusion control
+
+Use the same native simulator to run default, encoder-feedback and fused-feedback modes on the reference and candidate firmware. From the simulator checkout, supply both firmware checkouts and the public development workload:
+
+```sh
+python -B tools/fusion_comparison run --reference /path/to/reference-firmware --candidate /path/to/candidate-firmware --spec tools/fusion_comparison/development.json --out /path/to/new-comparison
+```
+
+The six original nominal dispersion values ship with the scorer. Each result includes paired tracking errors, source health, control comparisons and endpoint diagnostics. Keep each failed or incomplete run and use the supplied `score` command to replay saved traces. A subset can check installation and transport. Full development results and a separately specified release qualification have different evidence requirements. The tool consumes an explicit workload file and generates no new seed draw. See the [fusion comparison guide](../tools/fusion_comparison/README.md) for inputs, scope and exit codes.
+
 ## Public IMU regression
 
 For ordinary v0.4 IMU development and release checks, run one command from the
