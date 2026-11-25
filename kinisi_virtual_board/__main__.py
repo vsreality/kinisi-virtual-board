@@ -5,7 +5,7 @@ from pathlib import Path
 
 from . import Schema, TCPServer, VirtualBoard, FirmwareBoard
 from .native import PTYEndpoint, SerialEndpoint, serve_native
-from .imu_mount import IDENTITY, Mount
+from .imu_mount import IDENTITY, Mount, board_center_to_imu_m
 
 
 def main():
@@ -16,7 +16,9 @@ def main():
     parser.add_argument("--compiler", help="Host GCC/Clang executable; defaults to CC or auto-detection")
     parser.add_argument("--commands", type=Path, help="Shared commands.json; defaults to --firmware/commands.json")
     parser.add_argument("--board-profile", type=Path, help="Optional firmware boards/v0.x.json")
-    parser.add_argument("--imu-offset-m", metavar="X,Y,Z", help="Physical chip position in chassis metres")
+    position = parser.add_mutually_exclusive_group()
+    position.add_argument("--imu-board-center-m", metavar="X,Y,Z", help="v0.4 PCB underside center in chassis metres")
+    position.add_argument("--imu-offset-m", metavar="X,Y,Z", help="Legacy physical chip position in chassis metres")
     parser.add_argument("--imu-board-to-chassis", metavar="R00,...,R22",
                         help="Physical board-to-chassis rotation, nine row-major values")
     parser.add_argument("--revision", default="0.4.0", choices=["0.3.0", "0.3.1", "0.4.0"])
@@ -55,6 +57,8 @@ def main():
     mounting.add_argument("--firmware", type=Path, required=True)
     mounting.add_argument("--out", type=Path, required=True, help="New directory for frozen plan, wire traces and scores")
     mounting.add_argument("--compiler", default=argparse.SUPPRESS)
+    mounting.add_argument("--reference", choices=("chip", "board-center"), default="chip",
+                          help="Use chip coordinates (legacy default) or the v0.4 PCB underside center")
     mounting.add_argument("--development", action="store_true", help="Fingerprint uncommitted sources")
     mounting.add_argument("--case", action="append", dest="cases", help="Select a declared case; repeat for several")
     args = parser.parse_args()
@@ -90,7 +94,7 @@ def main():
     try:
         schema = Schema(args.commands or args.firmware / "commands.json")
         mount = None
-        if args.imu_offset_m is not None or args.imu_board_to_chassis is not None:
+        if any(value is not None for value in (args.imu_offset_m, args.imu_board_center_m, args.imu_board_to_chassis)):
             offset = args.imu_offset_m.split(",") if args.imu_offset_m is not None else (0., 0., 0.)
             matrix = IDENTITY
             if args.imu_board_to_chassis is not None:
@@ -98,7 +102,16 @@ def main():
                 if len(values) != 9:
                     raise ValueError("--imu-board-to-chassis requires nine row-major values")
                 matrix = (values[:3], values[3:6], values[6:])
-            mount = Mount(offset, matrix)
+            if args.imu_board_center_m is None:
+                mount = Mount(offset, matrix)
+            else:
+                profile_root = schema.path.parent if args.backend == "python" else args.firmware
+                profile_path = args.board_profile or profile_root / "boards" / "v0.4.json"
+                if not args.board_profile and args.revision != "0.4.0":
+                    raise ValueError("Board-center mounting requires v0.4 hardware with a BMI088")
+                profile = json.loads(profile_path.read_text(encoding="utf8"))
+                mount = Mount.from_board_center(args.imu_board_center_m.split(","), matrix,
+                                                center_to_imu_m=board_center_to_imu_m(profile))
         if args.backend == "firmware" and args.board_profile:
             raise ValueError("The firmware backend uses --firmware/boards and --revision; --board-profile is only for the Python model")
         def factory():
@@ -116,6 +129,8 @@ def main():
         report["native_build"] = board.build
     if mount is not None:
         report["physical_imu_mount"] = dict(offset_m=mount.offset_m, board_to_chassis=mount.board_to_chassis)
+        if args.imu_board_center_m is not None:
+            report["physical_imu_mount"]["board_center_m"] = tuple(map(float, args.imu_board_center_m.split(",")))
     if args.check:
         print(json.dumps(report, indent=2))
         if hasattr(board, "close"):

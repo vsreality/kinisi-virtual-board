@@ -603,6 +603,27 @@ API int sim_imu_mount(const double *offset_m, const double *board_to_chassis) {
     }
     return 1;
 }
+/* Optional host API. Geometry belongs to this library's selected board profile.
+ * -1: profile unavailable; 0: invalid setup; 1: accepted. Chip-offset ABI stays unchanged. */
+API int sim_imu_board_center(const double *center_m, const double *board_to_chassis) {
+#ifdef SIM_IMU_BOARD_GEOMETRY
+    sim_imu_mount_t validated = IMU_MOUNT_IDENTITY;
+    if (!sim_mount_set(&validated, center_m, board_to_chassis)) {
+        return 0;
+    }
+    double chip[3];
+    for (unsigned i = 0; i < 3; ++i) {
+        double displacement = 0.;
+        for (unsigned j = 0; j < 3; ++j) {
+            displacement += board_to_chassis[3 * i + j] * sim_board_center_to_imu_m[j];
+        }
+        chip[i] = center_m[i] + displacement;
+    }
+    return sim_imu_mount(chip, board_to_chassis);
+#else
+    return -1;
+#endif
+}
 API void sim_imu_observation(const double *values, int status, uint64_t accel_us, uint64_t gyro_us) {
     imu_injected = true; /* Exact injected values/status/timestamps stay frozen. */
     memcpy(&imu, values, sizeof(imu));

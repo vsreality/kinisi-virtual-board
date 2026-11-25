@@ -2,7 +2,7 @@ import math
 import unittest
 
 from kinisi_virtual_board.bmi088 import BMI088, G, LSB
-from kinisi_virtual_board.imu_mount import Mount
+from kinisi_virtual_board.imu_mount import IDENTITY, Mount, board_center_to_imu_m
 
 
 def register_delta(mount, acceleration=(0.0, 0.0, G), rate=0.0, alpha=0.0):
@@ -18,6 +18,44 @@ class PhysicalMountTests(unittest.TestCase):
     def check_registers(self, actual, expected):
         for axis, (got, want) in enumerate(zip(actual, expected, strict=True)):
             self.assertAlmostEqual(got, want, delta=2 * LSB[axis // 3], msg=f"chip axis {axis}")
+
+    def test_bottom_center_fixed_while_chip_rotates_and_accelerates(self):
+        profile = {"imu_geometry": {"underside_center_to_imu_um": [-15373, 26953, 2075]}}
+        vector = board_center_to_imu_m(profile)
+        # Independent dimensions in board axes, before micrometre encoding.
+        dx = (25.14 - 81.025126 / 2) * 0.001
+        dy = (66.025126 / 2 - 6.06) * 0.001
+        dz = (1.6 + 0.95 / 2) * 0.001
+        roll90 = ((1, 0, 0), (0, 0, -1), (0, 1, 0))
+        for orientation, y_center in ((IDENTITY, 0.0), (roll90, 0.0), (roll90, -0.100)):
+            with self.subTest(orientation=orientation, y_center=y_center):
+                chip = Mount.from_board_center((0.0, y_center, 0.0), orientation, center_to_imu_m=vector)
+                expected = (dx, y_center + dy, dz) if orientation == IDENTITY else (dx, y_center - dz, dy)
+                for actual, target in zip(chip.offset_m, expected):
+                    self.assertAlmostEqual(actual, target, delta=0.5e-6)
+                for alpha in (0.0, 1.0, -1.0):
+                    # Chassis-origin rotation at 2 rad/s. Specific force of U601
+                    # relative to an identically seeded centered, level sensor.
+                    x, y, _ = expected
+                    ax, ay = -4 * x - alpha * y, -4 * y + alpha * x
+                    if orientation == IDENTITY:
+                        expected_delta = (-ax, -ay, 0.0, 0.0, 0.0, 2.0)
+                    else:
+                        expected_delta = (-ax, -G, -ay - G, 0.0, -2.0, 0.0)
+                    self.check_registers(register_delta(chip, rate=2.0, alpha=alpha), expected_delta)
+
+    def test_board_center_uses_selected_profile_and_rejects_invalid_geometry(self):
+        vector = board_center_to_imu_m({"imu_geometry": {"underside_center_to_imu_um": [1000, -2000, 3000]}})
+        mount = Mount.from_board_center(
+            (0.1, 0.2, 0.3), ((0, -1, 0), (1, 0, 0), (0, 0, 1)), center_to_imu_m=vector
+        )
+        for actual, target in zip(mount.offset_m, (0.102, 0.201, 0.303)):
+            self.assertAlmostEqual(actual, target)
+        with self.assertRaisesRegex(ValueError, "lacks"):
+            board_center_to_imu_m({})
+        for invalid in ([True, 2, 3], [1, 2], [1.0, 2.0, 3.0], [0, 0, 2**31]):
+            with self.assertRaises(ValueError):
+                board_center_to_imu_m({"imu_geometry": {"underside_center_to_imu_um": invalid}})
 
     def test_centered_identity_preserves_every_legacy_sample(self):
         legacy, explicit = BMI088(131), BMI088(131, mount=Mount())

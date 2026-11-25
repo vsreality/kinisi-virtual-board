@@ -75,6 +75,25 @@ class Session:
 
 
 class ConfigurationTests(unittest.TestCase):
+    def test_released_chip_mount_survives_board_center_migration(self):
+        image = (LEGACY_IMAGES.parent / "configuration-v3" / "chip-mount.fram").read_bytes()
+        self.assertEqual(hashlib.sha256(image).hexdigest(),
+                         "0f46db0c4859af47d0dfc54ad95eab3746bdbdea516dd6f505247c214e22a9f5")
+        chip = (9000, 0, 0, 42000, -51000, 17000, 1)
+        center = (9000, 0, 0, 57373, -48925, -9953, 1)
+        for boot in ("released image", "resaved image"):
+            with self.subTest(boot=boot), FirmwareBoard(firmware=FIRMWARE, fram_image=image) as board:
+                if "GET_BOARD_MOUNT" not in board.schema.commands:
+                    self.skipTest("Selected firmware predates PCB underside-center mounting")
+                session = Session(board)
+                session.initialize()
+                self.assertEqual(struct.unpack("<hhhiiiB", session.ok("GET_IMU_MOUNT")), chip)
+                self.assertEqual(struct.unpack("<hhhiiiB", session.ok("GET_BOARD_MOUNT")), center)
+                self.assertEqual(session.ok("GET_IMU_TRACKING_STATUS")[0], 0)
+                self.assertEqual(board.motor_pwm, (0.,) * 4)
+                session.ok("SAVE_CONFIGURATION")
+                image = board.fram_image
+
     def test_legacy_factory_and_saved_setup(self):
         expected = [3, .12, .48, .31, 4096, 2000, 2000, 2000, 1, 1, 1, 0, 1, 0, 1, 0, 25000]
         images = {

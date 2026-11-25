@@ -13,7 +13,7 @@ not change the compiled firmware. No SDK or firmware sources are rewritten.
 ## Physical IMU installation
 
 The normal executable accepts the chip position relative to the chassis origin
-and a rigid board-to-chassis rotation. Offsets use metres in forward/left/up
+or the PCB underside center, and a rigid board-to-chassis rotation. Offsets use metres in forward/left/up
 coordinates. The rotation is row-major, maps board coordinates to chassis
 coordinates, and must be finite, orthonormal and right-handed (tolerance 1e-6).
 
@@ -21,9 +21,19 @@ coordinates, and must be finite, orthonormal and right-handed (tolerance 1e-6).
 .\build\native\kinisi-sim.exe --imu-offset-m "0,-0.1,0" --imu-board-to-chassis "1,0,0,0,1,0,0,0,1"
 ```
 
-This example places the chip 100 mm right of the chassis origin. The native
-no-slip motor/shaft plant adds tangential and centripetal acceleration at that
-point, rotates the specific force and angular rate into board axes, then uses
+The command above places the **chip** 100 mm right of the chassis origin.
+Use `--imu-board-center-m "0,-0.1,0"` to place the PCB underside center
+100 mm right of the chassis origin. This option and `--imu-offset-m` are mutually
+exclusive. The selected library embeds `imu_geometry.underside_center_to_imu_um`
+from its firmware checkout's hardware board profile at build time. It computes
+`chip = center + board_to_chassis * board_geometry`, using the profile's integer
+micrometre precision. Rotating a board around a fixed center therefore moves the
+chip. `--library` selects that library's geometry; there is no host fallback.
+Older profiles without this field and older libraries without this optional API
+reject board-center input explicitly while retaining the chip-offset interface.
+
+The native no-slip motor/shaft plant adds tangential and centripetal acceleration
+at the chip, rotates the specific force and angular rate into board axes, then uses
 the existing v0.4 chip convention `(-board X, -board Y, +board Z)` inside the
 BMI088 model. A static tilted installation starts at its projected gravity.
 An offset in height does not add rotational acceleration for planar yaw alone.
@@ -47,6 +57,10 @@ time starts or after exact input injection is rejected. `set_imu` continues to
 accept exact native chip-axis samples, bypassing the physical mount model.
 Neither physical interface declares a mount to a firmware estimator or changes
 its configuration. Firmware/SDK mount commands remain a separate declaration.
+The native `sim_imu_mount` ABI still accepts chip offsets. The optional
+`sim_imu_board_center(center_m, row_major_rotation)` API applies the selected
+profile geometry and returns 1 on success, 0 for invalid setup, or -1 when the
+profile has no geometry. Both setters require clock zero and modeled IMU input.
 
 ## Linux
 

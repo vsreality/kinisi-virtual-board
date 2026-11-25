@@ -59,8 +59,9 @@ For the full 144-case chassis qualification run
 It saves its public plan, sensor inputs and results automatically.
 [Qualification matrix and replay](docs/release-test-plan.md#full-public-imu-release-qualification)
 
-For v0.4 protocol 2.23, exercise IMU-only and fused tracking across nine physical
-installations with the [74-case mounting qualification](docs/release-test-plan.md#physical-mounting-qualification).
+For Mini v0.4, run the PCB underside-center mounting qualification on protocol 2.24
+and the chip-referenced compatibility cases on protocol 2.23 or later.
+[Mounting cases and commands](docs/release-test-plan.md#physical-mounting-qualification)
 
 Run the eight native feedback source selector scenarios and export SDK packet
 examples with a clean candidate checkout:

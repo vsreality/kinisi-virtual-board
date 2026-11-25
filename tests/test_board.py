@@ -4,6 +4,8 @@ import math
 import os
 from pathlib import Path
 import struct
+import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -284,6 +286,28 @@ class BoardTests(unittest.TestCase):
         self.board.advance(.1)
         self.assertEqual(struct.unpack("<6d", self.ok("GET_IMU")), (1, 2, 3, 4, 5, 6))
 
+    def test_serving_uses_the_selected_board_profile_for_center_geometry(self):
+        with tempfile.TemporaryDirectory() as directory:
+            profile = json.loads((COMMANDS.parent / "boards" / "v0.4.json").read_bytes())
+            profile["imu_geometry"] = {"underside_center_to_imu_um": [5000, -4000, 3000]}
+            selected = Path(directory) / "board.json"
+            selected.write_text(json.dumps(profile), encoding="utf8")
+            cmd = [sys.executable, "-B", "-m", "kinisi_virtual_board", "--backend", "python",
+                   "--commands", str(COMMANDS), "--board-profile", str(selected),
+                   "--imu-board-center-m=0,-0.1,0", "--imu-board-to-chassis=1,0,0,0,0,-1,0,1,0", "--check"]
+            check = subprocess.run(cmd, capture_output=True, text=True)
+            report = json.loads(check.stdout)
+            self.assertEqual(check.returncode, int(bool(report["unsupported_commands"])), check.stderr)
+            physical = report["physical_imu_mount"]
+            self.assertEqual(physical["board_center_m"], [0., -.1, 0.])
+            for value, expected in zip(physical["offset_m"], (.005, -.103, -.004)):
+                self.assertAlmostEqual(value, expected)
+            del profile["imu_geometry"]
+            selected.write_text(json.dumps(profile), encoding="utf8")
+            check = subprocess.run(cmd, capture_output=True, text=True)
+            self.assertEqual(check.returncode, 2)
+            self.assertIn("underside_center_to_imu_um", check.stderr)
+
     def test_bmi088_watchdog_stop_preserves_sensor_step_cadence(self):
         one = VirtualBoard(COMMANDS)
         many = VirtualBoard(COMMANDS)
@@ -413,7 +437,7 @@ class BoardTests(unittest.TestCase):
                                       "GET_FEEDBACK_SOURCE_STATUS", "GET_FEEDBACK_SOURCE_VECTOR",
                                       "SET_FEEDBACK_FUSION_MOUNT", "GET_FEEDBACK_FUSION_MOUNT",
                                       "GET_FEEDBACK_SOURCE_HEALTH", "GET_FEEDBACK_IMU_CHANNELS",
-                                      "SET_IMU_MOUNT", "GET_IMU_MOUNT")
+                                      "SET_IMU_MOUNT", "GET_IMU_MOUNT", "SET_BOARD_MOUNT", "GET_BOARD_MOUNT")
                      if name in self.board.schema.commands]
         self.assertEqual(self.board.unsupported_commands, sorted(expected))
 

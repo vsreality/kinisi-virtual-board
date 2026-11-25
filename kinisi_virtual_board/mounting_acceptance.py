@@ -7,7 +7,9 @@ Every output directory is new, and exceptions retain partial wire evidence.
 import hashlib
 import json
 import math
+import os
 from pathlib import Path
+import time
 import traceback
 
 from .feedback_selector.runner import HERE, SIM, Session, pin
@@ -50,7 +52,40 @@ def rotation(angles):
     )
 
 
-def plan():
+def _installations(reference):
+    if reference == "chip":
+        return MOUNTS
+    if reference != "board-center":
+        raise ValueError("Reference must be chip or board-center")
+    return dict(
+        MOUNTS,
+        right=((0, -0.1, 0), (90, 0, 0)),
+        bottom_reorientation=((0, 0, 0), (90, 0, 0)),
+    )
+
+
+def _cad_vector_um():
+    # Independent mechanical oracle: outline center, U601 placement, PCB and
+    # package height. Do not substitute firmware constants into this check.
+    return (
+        round((148.14 - (123 + 204.025126) / 2) * 1000),
+        round(((55.5 + 121.525126) / 2 - 61.56) * 1000),
+        round((1.6 + 0.95 / 2) * 1000),
+    )
+
+
+def _profile_vector(firmware):
+    from .imu_mount import board_center_to_imu_m
+
+    profile = json.loads((firmware / "boards" / "v0.4.json").read_bytes())
+    vector = board_center_to_imu_m(profile)
+    if tuple(round(v * 1e6) for v in vector) != _cad_vector_um():
+        raise AssertionError("Board IMU geometry differs from the independent Mini CAD datum")
+    return vector
+
+
+def plan(reference="chip"):
+    installations = _installations(reference)
     cases = [
         dict(case=f"{mount}-{profile}-{mode}", mount=mount, profile=profile, mode=mode)
         for mount in MOUNTS
@@ -58,18 +93,46 @@ def plan():
         for mode in ("imu", "fused")
     ]
     cases += [
-        dict(case="right-fast-steady-fused", mount="right", profile="fast_steady_yaw", mode="fused"),
-        dict(case="combined-disagreement-fused", mount="combined", profile="fault", mode="fused"),
+        dict(
+            case="right-fast-steady-fused",
+            mount="right",
+            profile="fast_steady_yaw",
+            mode="fused",
+        ),
+        dict(
+            case="combined-disagreement-fused",
+            mount="combined",
+            profile="fault",
+            mode="fused",
+        ),
     ]
+    if reference == "board-center":
+        cases += [
+            dict(
+                case=f"bottom-reorientation-changing_yaw-{mode}",
+                mount="bottom_reorientation",
+                profile="changing_yaw",
+                mode=mode,
+            )
+            for mode in ("imu", "fused")
+        ]
+    for case in cases:
+        case["reference"] = reference
     return dict(
-        design="public-mounting-v1",
+        design="public-mounting-v1" if reference == "chip" else "public-board-center-mounting-v1",
+        reference=reference,
+        board_center_oracle_um=_cad_vector_um() if reference == "board-center" else None,
         seed=SEED,
         delay_us=DELAY_US,
         step_us=STEP_US,
         limits=LIMITS,
         mounts={
-            key: dict(offset_m=value[0], rpy_degrees=value[1], board_to_chassis=rotation(value[1]))
-            for key, value in MOUNTS.items()
+            key: dict(
+                offset_m=value[0],
+                rpy_degrees=value[1],
+                board_to_chassis=rotation(value[1]),
+            )
+            for key, value in installations.items()
         },
         timing=dict(
             settle_us=600000,
@@ -80,6 +143,7 @@ def plan():
             normal_motion="Straight +0.24 m/s²; turn +1.6 rad/s² for .5s then hold .8 rad/s or brake at -1.6 rad/s².",
             fast_motion="Right-offset fused: +1 rad/s² for 2s, hold 2 rad/s; score [A+2.05s,A+3.05s), retaining origin A.",
             fault="Combined mount: after calibration, gyro .8 rad/s for 1.2s with fixed wheels, then rest 1.5s.",
+            reorientation="Board-center only: flat to roll+90 at fixed underside center (0,0,0), same stopped boot; setup-only change, motion scored after save/reboot and fresh calibration.",
         ),
         cases=cases,
     )
@@ -99,18 +163,39 @@ def _dump(path, value):
 
     temporary = path.with_name(path.name + ".tmp")
     temporary.write_text(json.dumps(json_value(value), indent=2, allow_nan=False) + "\n", encoding="utf8")
-    temporary.replace(path)
+    for attempt in range(5):
+        try:
+            temporary.replace(path)
+            break
+        except OSError as error:
+            # A concurrent Windows reader can briefly deny replacing an
+            # existing summary. Retry that atomic step only, for at most375ms.
+            if (
+                os.name != "nt"
+                or getattr(error, "winerror", None) not in (5, 32, 33)
+                or not path.exists()
+                or attempt == 4
+            ):
+                raise
+            time.sleep(0.025 * 2**attempt)
 
 
 class PhysicalInput:
     """Only timer counts and BMI088 register observations cross into firmware."""
 
-    def __init__(self, session, mount):
+    def __init__(self, session, mount, reference="chip", *, angles=None):
         from .bmi088 import BMI088
         from .imu_mount import Mount
 
-        offset, angles = MOUNTS[mount]
-        self.sensor = BMI088(SEED, mount=Mount(offset, rotation(angles)))
+        offset, declared_angles = _installations(reference)[mount]
+        angles = declared_angles if angles is None else angles
+        self.center_to_imu = _profile_vector(session.firmware) if reference == "board-center" else None
+        physical = (
+            Mount.from_board_center(offset, rotation(angles), center_to_imu_m=self.center_to_imu)
+            if reference == "board-center"
+            else Mount(offset, rotation(angles))
+        )
+        self.sensor = BMI088(SEED, mount=physical)
         self.session = session
         self.pending, self.last = [], (0, 0)
         self.stamps, self.values = [0, 0], [0.0, 0.0, 9.80665, 0.0, 0.0, 0.0]
@@ -124,7 +209,12 @@ class PhysicalInput:
         for channel, stamp in enumerate(stamps):
             if stamp != self.last[channel]:
                 self.pending.append(
-                    (stamp + DELAY_US, channel, stamp, self.sensor.values[3 * channel : 3 * channel + 3])
+                    (
+                        stamp + DELAY_US,
+                        channel,
+                        stamp,
+                        self.sensor.values[3 * channel : 3 * channel + 3],
+                    )
                 )
         self.last = stamps
         # Independent mecanum rolling constraint, .1m wheels, .34m x .26m body.
@@ -148,7 +238,12 @@ class PhysicalInput:
             self.stamps[channel] = stamp
             self.values[3 * channel : 3 * channel + 3] = values
         if due:
-            s.board.set_imu(self.values[:3], self.values[3:], accel_us=self.stamps[0], gyro_us=self.stamps[1])
+            s.board.set_imu(
+                self.values[:3],
+                self.values[3:],
+                accel_us=self.stamps[0],
+                gyro_us=self.stamps[1],
+            )
         s.mark(
             "physical_input",
             specific_force=(accel, 0.0, 9.80665),
@@ -162,13 +257,18 @@ class PhysicalInput:
         )
 
 
-def _geometry(s, name, stimulus):
+def _geometry(s, name, stimulus, reference="chip"):
     # Validate positional contract before relying on its field order. Names are
     # recorded from the actual canonical schema, so no SDK aliases are assumed.
-    for command in ("SET_IMU_MOUNT", "GET_IMU_MOUNT"):
+    setter, getter = (
+        ("SET_BOARD_MOUNT", "GET_BOARD_MOUNT")
+        if reference == "board-center"
+        else ("SET_IMU_MOUNT", "GET_IMU_MOUNT")
+    )
+    for command in (setter, getter, "SET_IMU_MOUNT", "GET_IMU_MOUNT"):
         if command not in s.schema.commands:
             raise LookupError(f"Firmware protocol {s.schema.version} lacks {command}")
-    props = s.schema.commands["SET_IMU_MOUNT"]["properties"]
+    props = s.schema.commands[setter]["properties"]
     contract = list(
         zip(
             ("roll_cdeg", "pitch_cdeg", "yaw_cdeg", "x_um", "y_um", "z_um"),
@@ -176,8 +276,8 @@ def _geometry(s, name, stimulus):
         )
     )
     if [(p["name"], p["type"]) for p in props] != contract:
-        raise ValueError("Mount request differs from the six-field 2.23 contract")
-    offset, angles = MOUNTS[name]
+        raise ValueError("Mount request differs from the canonical six-field contract")
+    offset, angles = _installations(reference)[name]
     fields = dict(
         zip(
             (p["name"] for p in props),
@@ -185,23 +285,90 @@ def _geometry(s, name, stimulus):
             strict=True,
         )
     )
-    try:
-        s.ask("SET_IMU_MOUNT", **fields)
-    except CommandError as exc:
-        if exc.code != s.schema.errors["SOURCE_SWITCH_UNSAFE"]:
-            raise
-        # The first configuration attempt enables the cold safety sampler.
-        # Observe physically stationary counters before the deliberate retry.
+
+    def write(command, values):
+        try:
+            s.ask(command, **values)
+        except CommandError as exc:
+            if exc.code != s.schema.errors["SOURCE_SWITCH_UNSAFE"]:
+                raise
+            for _ in range(150000 // STEP_US):
+                stimulus.step()
+            s.ask(command, **values)
+
+    def read(values):
+        observed = s.ask(getter)
+        if (
+            any(observed.get(key) != value for key, value in values.items())
+            or observed.get("configured") != 1
+        ):
+            raise AssertionError(f"Mount readback mismatch: {values} -> {observed}")
+        chip = s.ask("GET_IMU_MOUNT") if reference == "board-center" else observed
+        if reference == "board-center":
+            matrix = rotation(tuple(values[k] / 100 for k in ("roll_cdeg", "pitch_cdeg", "yaw_cdeg")))
+            datum = _cad_vector_um()
+            for index, key in enumerate(("x_um", "y_um", "z_um")):
+                expected = values[key] + sum(matrix[index][j] * datum[j] for j in range(3))
+                if abs(chip[key] - expected) > 0.500001:
+                    raise AssertionError(f"Effective chip offset {key}: {chip[key]} != rounded {expected}")
+            if (
+                any(chip[key] != values[key] for key in ("roll_cdeg", "pitch_cdeg", "yaw_cdeg"))
+                or chip["configured"] != 1
+            ):
+                raise AssertionError("Effective chip orientation or configuration differs")
+        return observed, chip
+
+    reorientation = []
+    if name == "bottom_reorientation":
+        flat = dict(fields, roll_cdeg=0, pitch_cdeg=0, yaw_cdeg=0)
+        write(setter, flat)
+        center, chip = read(flat)
+        reorientation.append(dict(phase="flat", boot=s.boot, center=center, chip=chip))
+        s.mark(
+            "board_center_reorientation",
+            phase="flat",
+            setup_only=True,
+            center=center,
+            chip=chip,
+        )
         for _ in range(150000 // STEP_US):
             stimulus.step()
-        s.ask("SET_IMU_MOUNT", **fields)
-    observed = s.ask("GET_IMU_MOUNT")
-    if any(observed.get(key) != value for key, value in fields.items()) or observed.get("configured") != 1:
-        raise AssertionError(f"Mount readback mismatch: {fields} -> {observed}")
+        from .imu_mount import Mount
+
+        stimulus.sensor.mount = Mount.from_board_center(
+            offset, rotation(angles), center_to_imu_m=stimulus.center_to_imu
+        )
+    write(setter, fields)
+    observed, chip = read(fields)
+    if reorientation:
+        reorientation.append(dict(phase="vertical", boot=s.boot, center=observed, chip=chip))
+        s.mark(
+            "board_center_reorientation",
+            phase="vertical",
+            setup_only=True,
+            center=observed,
+            chip=chip,
+        )
+        for _ in range(150000 // STEP_US):
+            stimulus.step()
+    legacy_roundtrip = None
+    if reference == "board-center":
+        # The legacy setter must continue to interpret XYZ as chip coordinates.
+        write("SET_IMU_MOUNT", {key: chip[key] for key in fields})
+        legacy_chip, legacy_center = s.ask("GET_IMU_MOUNT"), s.ask(getter)
+        if legacy_chip != chip or legacy_center.get("configured") != 1:
+            raise AssertionError("Legacy chip setter changed effective geometry")
+        for key in fields:
+            tolerance = 1 if key in ("x_um", "y_um", "z_um") else 0
+            if abs(legacy_center[key] - fields[key]) > tolerance:
+                raise AssertionError("Legacy chip-to-board readback changed the operator pose")
+        legacy_roundtrip = dict(chip=legacy_chip, board_center=legacy_center)
+        write(setter, fields)  # Restore exact operator coordinates before saving.
+        observed, chip = read(fields)
     s.ask("SAVE_CONFIGURATION")
     image = s.board.fram_image
     s.reboot(image)
-    restored = s.ask("GET_IMU_MOUNT")
+    restored, restored_chip = read(fields)
     if restored != observed:
         raise AssertionError(f"Saved mounting geometry changed on reboot: {restored}")
     if s.ask("GET_IMU_TRACKING_STATUS")["state"] != 0 or s.status()["valid"]:
@@ -212,6 +379,12 @@ def _geometry(s, name, stimulus):
         readback=observed,
         reboot_readback=restored,
         fram_sha256=hashlib.sha256(image).hexdigest(),
+        reference=reference,
+        effective_chip=chip,
+        reboot_effective_chip=restored_chip,
+        legacy_roundtrip=legacy_roundtrip,
+        reorientation=reorientation,
+        physical_center_to_imu_m=stimulus.center_to_imu,
     )
 
 
@@ -249,21 +422,37 @@ def capture(s, case, result):
     result["build"] = s.board.build
     # Boot/INIT occur even on an old release: its unsupported interface is
     # observed and preserved, rather than treating absent coverage as a pass.
-    if "SET_IMU_MOUNT" not in s.schema.commands:
-        raise LookupError(f"Firmware protocol {s.schema.version} lacks SET_IMU_MOUNT")
+    reference = case.get("reference", "chip")
+    setter = "SET_BOARD_MOUNT" if reference == "board-center" else "SET_IMU_MOUNT"
+    if setter not in s.schema.commands:
+        raise LookupError(f"Firmware protocol {s.schema.version} lacks {setter}")
     s.ask(
-        "INITIALIZE_MECANUM_PLATFORM", wheels_diameter=0.1, length=0.34, width=0.26, encoder_resolution=4096
+        "INITIALIZE_MECANUM_PLATFORM",
+        wheels_diameter=0.1,
+        length=0.34,
+        width=0.26,
+        encoder_resolution=4096,
     )
-    before_reboot = PhysicalInput(s, case["mount"])
-    result["geometry"] = _geometry(s, case["mount"], before_reboot)
-    stimulus = PhysicalInput(s, case["mount"])
+    before_reboot = PhysicalInput(
+        s,
+        case["mount"],
+        reference,
+        angles=(0, 0, 0) if case["mount"] == "bottom_reorientation" else None,
+    )
+    result["geometry"] = _geometry(s, case["mount"], before_reboot, reference)
+    stimulus = PhysicalInput(s, case["mount"], reference)
     s.ask("START_PLATFORM_ODOMETRY")
     for _ in range(600000 // STEP_US):
         stimulus.step()
     source = 1 if case["mode"] == "imu" else 2
     s.ask("SET_FEEDBACK_SOURCE", source=source)
     if source == 1:
-        s.ask("SET_IMU_TRACKING", action=0, stationary_mount_confirmed=1, mounting_yaw_rad=0.0)
+        s.ask(
+            "SET_IMU_TRACKING",
+            action=0,
+            stationary_mount_confirmed=1,
+            mounting_yaw_rad=0.0,
+        )
     else:
         s.ask("SET_FEEDBACK_FUSION_MOUNT", mounting_yaw_rad=0.0)
     deadline = s.board.now_us + 1500000
@@ -292,7 +481,12 @@ def capture(s, case, result):
                     selected = _reading(s)
                     observed = sources(s)
                     health.append(
-                        dict(phase=phase, public_us=s.board.now_us, sources=observed, selected=selected)
+                        dict(
+                            phase=phase,
+                            public_us=s.board.now_us,
+                            sources=observed,
+                            selected=selected,
+                        )
                     )
                     status = selected["status"]
                     if status["requested"] != 2 or status["active"] != (2 if status["valid"] else 255):
@@ -342,9 +536,10 @@ def run(args):
     if output.exists():
         raise FileExistsError(f"Output must be new: {output}")
     identity = dict(
-        firmware=pin(firmware, args.development, output), simulator=pin(SIM, args.development, output)
+        firmware=pin(firmware, args.development, output),
+        simulator=pin(SIM, args.development, output),
     )
-    frozen = plan()
+    frozen = plan(getattr(args, "reference", "chip"))
     chosen = args.cases or [case["case"] for case in frozen["cases"]]
     known = {case["case"]: case for case in frozen["cases"]}
     if len(set(chosen)) != len(chosen) or set(chosen) - known.keys():
@@ -352,11 +547,21 @@ def run(args):
     output.mkdir(parents=True, exist_ok=False)
     scripts = {
         name: hashlib.sha256((Path(__file__).parent / name).read_bytes()).hexdigest()
-        for name in ("mounting_acceptance.py", "mounting_acceptance_score.py", "__main__.py")
+        for name in (
+            "mounting_acceptance.py",
+            "mounting_acceptance_score.py",
+            "__main__.py",
+        )
     }
-    _dump(output / "plan.json", dict(**frozen, selected_cases=chosen, scripts=scripts, **identity))
+    _dump(
+        output / "plan.json",
+        dict(**frozen, selected_cases=chosen, scripts=scripts, **identity),
+    )
     summary = dict(
-        **identity, plan_sha256=hashlib.sha256((output / "plan.json").read_bytes()).hexdigest(), cases={}
+        **identity,
+        reference=frozen["reference"],
+        plan_sha256=hashlib.sha256((output / "plan.json").read_bytes()).hexdigest(),
+        cases={},
     )
 
     def save_summary():

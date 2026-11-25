@@ -2,6 +2,7 @@
 
 import ctypes as ct
 import math
+import json
 import os
 from pathlib import Path
 import struct
@@ -10,7 +11,7 @@ import unittest
 
 from kinisi_virtual_board import FirmwareBoard
 from kinisi_virtual_board.bmi088 import BMI088, G
-from kinisi_virtual_board.imu_mount import Mount, IDENTITY
+from kinisi_virtual_board.imu_mount import Mount, IDENTITY, board_center_to_imu_m
 from tools.encoder_baseline import Wire
 from test_firmware import FIRMWARE
 from test_imu_observation import read_observation
@@ -208,13 +209,145 @@ class StandaloneMountTests(unittest.TestCase):
             self.assertEqual(
                 good.stdout[8:12], bytes([1, *map(int, revision.split("."))])
             )
-            bad = subprocess.run(
-                [*args, "--imu-offset-m", "0,0,0"],
+            for flag in ("--imu-offset-m", "--imu-board-center-m"):
+                bad = subprocess.run(
+                    [*args, flag, "0,0,0"],
+                    input=b"",
+                    capture_output=True,
+                    timeout=15,
+                )
+                self.assertNotEqual(bad.returncode, 0)
+
+    def test_board_geometry_header_validates_profile(self):
+        from kinisi_virtual_board.firmware_build import _imu_geometry_header
+
+        self.assertEqual(_imu_geometry_header({}), "")
+        for vector in ([1, 2], [True, 2, 3], [1.0, 2, 3], [2**31, 2, 3], None):
+            with self.subTest(vector=vector), self.assertRaises(ValueError):
+                _imu_geometry_header(
+                    {"imu_geometry": {"underside_center_to_imu_um": vector}}
+                )
+        header = _imu_geometry_header(
+            {"imu_geometry": {"underside_center_to_imu_um": [-15373, 26953, 2075]}}
+        )
+        self.assertIn("{-0.015373,0.026953,0.002075}", header)
+
+    def test_cli_board_center_and_fixed_center_rotations(self):
+        binary = os.environ.get("KINISI_NATIVE_BINARY")
+        if not binary or not Path(binary).is_file():
+            self.skipTest(
+                "Set KINISI_NATIVE_BINARY to a matching newly built native host"
+            )
+        profile = json.loads((FIRMWARE / "boards/v0.4.json").read_text())
+        if "imu_geometry" not in profile:
+            result = subprocess.run(
+                [binary, "--stdio-test", "--imu-board-center-m", "0,0,0"],
                 input=b"",
                 capture_output=True,
                 timeout=15,
             )
-            self.assertNotEqual(bad.returncode, 0)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn(b"geometry", result.stderr)
+            return
+        local = board_center_to_imu_m(profile)
+        center = (0.03, -0.08, 0.04)
+        rotations = (
+            IDENTITY,
+            ((0.0, -1.0, 0.0), (1.0, 0.0, 0.0), (0.0, 0.0, 1.0)),
+            ((1.0, 0.0, 0.0), (0.0, 0.0, -1.0), (0.0, 1.0, 0.0)),
+        )
+        streams = []
+        for rotation in rotations:
+            mount = Mount.from_board_center(center, rotation, center_to_imu_m=local)
+            with (
+                self.subTest(rotation=rotation),
+                FirmwareBoard(firmware=FIRMWARE, imu_mount=mount) as board,
+            ):
+                operations, expected = [], []
+
+                def request(name, **fields):
+                    data = board.schema.request(name, 42, **fields)
+                    operations.append(b"F" + struct.pack("<I", len(data)) + data)
+                    board.feed(data)
+                    expected.append(board.drain())
+
+                request(
+                    "INIT",
+                    sdk_type=1,
+                    protocol_major=board.schema.version[0],
+                    protocol_minor=board.schema.version[1],
+                    client_capabilities=2,
+                )
+                request(
+                    "INITIALIZE_MECANUM_PLATFORM",
+                    wheels_diameter=0.1,
+                    length=0.34,
+                    width=0.26,
+                    encoder_resolution=4096,
+                )
+                request("SET_PLATFORM_VELOCITY", x=20.0, y=-5.0, t=10.0)
+                for _ in range(25):
+                    operations.append(b"A" + struct.pack("<IQ", 8, 10000))
+                    board.advance(0.01)
+                    expected.append(board.drain())
+                    request("GET_IMU")
+            wire = b"".join(operations)
+            expected_wire = b"".join(
+                struct.pack("<I", len(value)) + value for value in expected
+            )
+            matrix = ",".join(str(v) for row in rotation for v in row)
+            for flag, vector in (
+                ("--imu-board-center-m", center),
+                ("--imu-offset-m", mount.offset_m),
+            ):
+                result = subprocess.run(
+                    [
+                        binary,
+                        "--stdio-test",
+                        flag,
+                        ",".join(map(str, vector)),
+                        "--imu-board-to-chassis",
+                        matrix,
+                    ],
+                    input=wire,
+                    capture_output=True,
+                    timeout=30,
+                )
+                self.assertEqual(
+                    result.returncode, 0, result.stderr.decode(errors="replace")
+                )
+                self.assertEqual(result.stdout, expected_wire)
+            streams.append(expected_wire)
+        self.assertEqual(len(set(streams)), len(rotations))
+
+    def test_cli_board_center_rejects_conflicts_and_bad_values(self):
+        binary = os.environ.get("KINISI_NATIVE_BINARY")
+        if not binary or not Path(binary).is_file():
+            self.skipTest(
+                "Set KINISI_NATIVE_BINARY to a matching newly built native host"
+            )
+        for flags in (
+            ["--imu-board-center-m", "0,0,0", "--imu-offset-m", "0,0,0"],
+            ["--imu-offset-m", "0,0,0", "--imu-board-center-m", "0,0,0"],
+            ["--imu-board-center-m", "0,nan,0"],
+            ["--imu-board-center-m", "0,0"],
+            [
+                "--imu-board-center-m",
+                "0,0,0",
+                "--imu-board-to-chassis",
+                "1,0,0,0,1,0,0,0,-1",
+            ],
+        ):
+            with self.subTest(flags=flags):
+                result = subprocess.run(
+                    [binary, "--stdio-test", *flags],
+                    input=b"",
+                    capture_output=True,
+                    timeout=15,
+                )
+                self.assertNotEqual(result.returncode, 0)
+                if "--imu-offset-m" in flags:
+                    self.assertIn(b"mutually exclusive", result.stderr)
 
     def test_cli_mount_matches_python_host_wire_bytes(self):
         binary = os.environ.get("KINISI_NATIVE_BINARY")

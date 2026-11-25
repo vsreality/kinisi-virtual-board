@@ -82,6 +82,8 @@ int main(int argc,char** argv) {
 #endif
         bool test=false;
         bool mounted = false;
+        bool chip_position = false;
+        bool board_center = false;
         std::array<double, 3> imu_offset{};
         std::array<double, 9> imu_rotation{1., 0., 0., 0., 1., 0., 0., 0., 1.};
         for(int i=1;i<argc;++i) {
@@ -90,6 +92,12 @@ int main(int argc,char** argv) {
             else if(option=="--library" && i+1<argc)library=argv[++i];
             else if (option == "--imu-offset-m" && i + 1 < argc) {
                 imu_offset = mount_numbers<3>(argv[++i]);
+                chip_position = true;
+                mounted = true;
+            }
+            else if (option == "--imu-board-center-m" && i + 1 < argc) {
+                imu_offset = mount_numbers<3>(argv[++i]);
+                board_center = true;
                 mounted = true;
             }
             else if (option == "--imu-board-to-chassis" && i + 1 < argc) {
@@ -101,13 +109,31 @@ int main(int argc,char** argv) {
                   "  kinisi-sim [--library PATH]\n"
                   "Creates one Windows COM device (installed Kinisi driver required) or Linux PTY.\n"
                   "  --imu-offset-m x,y,z   chip position in chassis forward/left/up metres\n"
+                  "  --imu-board-center-m x,y,z   PCB underside center (excludes --imu-offset-m)\n"
                   "  --imu-board-to-chassis r00,r01,...,r22   proper rotation, row-major\n"
                   "  --stdio-test   deterministic binary test interface\n";return 0;
             } else throw std::runtime_error("Unknown option: "+option);
         }
+        if (chip_position && board_center) {
+            throw std::runtime_error("--imu-board-center-m and --imu-offset-m are mutually exclusive");
+        }
         Firmware firmware(library);Plant plant(firmware);
-        if (mounted && !firmware.imu_mount(imu_offset.data(), imu_rotation.data())) {
-            throw std::runtime_error("IMU mount requires an IMU board and a proper orthonormal rotation");
+        if (mounted) {
+            int accepted = 0;
+            if (board_center) {
+                if (!firmware.imu_board_center) {
+                    throw std::runtime_error("Selected library lacks board-center IMU geometry support");
+                }
+                accepted = firmware.imu_board_center(imu_offset.data(), imu_rotation.data());
+                if (accepted < 0) {
+                    throw std::runtime_error("Selected board profile lacks imu_geometry.underside_center_to_imu_um");
+                }
+            } else {
+                accepted = firmware.imu_mount(imu_offset.data(), imu_rotation.data());
+            }
+            if (!accepted) {
+                throw std::runtime_error("IMU mount requires an IMU board and a proper orthonormal rotation");
+            }
         }
         if(test)return stdio_test(firmware,plant);
         auto port=open_port();

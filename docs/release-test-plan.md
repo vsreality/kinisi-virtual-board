@@ -114,13 +114,16 @@ Two cases exercise commands that crossed an encoder fault. A fragmented chassis 
 
 ## Physical mounting qualification
 
-From a clean simulator checkout, pass a v0.4 firmware checkout with protocol 2.23 physical mount support and a new output directory:
+From a clean simulator checkout, supply a clean Mini v0.4 firmware checkout and a new output directory for each run.
 
 ```sh
-python -B -m kinisi_virtual_board mounting-acceptance --firmware /path/to/firmware --out /path/to/new-mounting-results
+python -B -m kinisi_virtual_board mounting-acceptance --reference board-center --firmware /path/to/firmware --out /path/to/center-results
+python -B -m kinisi_virtual_board mounting-acceptance --reference chip --firmware /path/to/firmware --out /path/to/chip-results
 ```
 
-The fixture measures to the BMI088 chip in chassis metres and uses a board-to-chassis rotation. It exercises centered, left, right, four vertical orientations, inverted, and combined offset/angle installations. Each installation sees rest, forward acceleration, a turn reaching constant rate and a changing-rate turn in both IMU-only and passive fused tracking. Additional cases cover a 2 rad/s right-offset turn and persistent contradictory wheel and inertial readings. Registration, saved readback, reboot and disarmed outputs use the real native firmware. The sensor plant supplies independently timed chip-axis values. The scorer compares the reported chassis-origin pose and twist against the maneuver at each observed source timestamp.
+Protocol 2.24 board-center mode places the underside center in chassis metres, checks the hardware profile against PCB geometry, and exercises board and chip readback. The board-center matrix has 76 cases, including a vertical board 100 mm to the right and reorientation around a fixed bottom center in each tracking mode. Chip mode retains the original 74-case protocol 2.23 suite and is the default for existing scripts.
+
+Both suites exercise rest, forward acceleration, steady and changing yaw on flat, vertical, inverted and compound installations in IMU-only and passive fused tracking. Additional cases cover a 2 rad/s right-offset turn and conflicting wheel and inertial readings. Configuration, saved readback, reboot and disarmed outputs use real native firmware. The plant supplies independently timed chip-axis values. The scorer compares reported chassis-origin pose and twist against the maneuver at each observed source timestamp.
 
 The one-second error limits are 0.050 m planar position, 0.020 m/s planar velocity, 2° relative yaw and 0.020 rad/s yaw rate. `plan.json` fixes the sensor seed, timing and planned coverage before cases execute. `summary.json` links outcomes to the individual captures and scoring evidence. Exit 0 means the requested cases passed, 1 indicates a measured failure, and 2 indicates incomplete evidence. A focused `--case` run covers just its named cases. Repeat the centered IMU regression and fault checks on the same firmware for compatibility. [Sensor model and serving flags](bmi088.md)
 

@@ -9,6 +9,8 @@ import subprocess
 import sys
 import tempfile
 
+from .imu_mount import board_center_to_imu_m
+
 SUPPORT = Path(__file__).with_name("firmware_support")
 DEFAULT_FIRMWARE = Path(__file__).resolve().parents[2] / "kinisi-motor-controller-firmware"
 SOURCES = (
@@ -67,6 +69,17 @@ def _hardware_header(profile):
     return "\n".join(lines) + "\n"
 
 
+def _imu_geometry_header(profile):
+    if "imu_geometry" not in profile:
+        return ""
+    geometry = board_center_to_imu_m(profile)
+    return (
+        "#define SIM_IMU_BOARD_GEOMETRY 1\n"
+        "static const double sim_board_center_to_imu_m[3] = {"
+        + ",".join(repr(value) for value in geometry) + "};\n"
+    )
+
+
 def build_firmware(schema, firmware=DEFAULT_FIRMWARE, revision="0.4.0", compiler=None):
     """Return a content-addressed library plus provenance. Never modify the checkout."""
     firmware = Path(firmware).resolve()
@@ -96,6 +109,7 @@ def build_firmware(schema, firmware=DEFAULT_FIRMWARE, revision="0.4.0", compiler
         sources += ("lib/hardware/hw_motor.c", "lib/hardware/hw_drv8873.c")
         includes += ("test/test_motor_control/stubs",)
         header = '#pragma once\n#include "sim_pin_map.h"\n#define SIM_DRIVER_HAL 1\n'
+    header += _imu_geometry_header(profile)
     if dual_pwm:
         header += "#define SIM_DUAL_TRANSPORT 1\n"
         sources += ("lib/utils/src/message_queue.c",)

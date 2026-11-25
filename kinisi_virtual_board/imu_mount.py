@@ -7,6 +7,21 @@ IDENTITY = ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0))
 ROTATION_TOLERANCE = 1e-6
 
 
+def board_center_to_imu_m(profile):
+    """Read board-frame sensor geometry from the selected hardware definition."""
+    try:
+        vector = profile["imu_geometry"]["underside_center_to_imu_um"]
+    except (KeyError, TypeError) as error:
+        raise ValueError("Board profile lacks imu_geometry.underside_center_to_imu_um") from error
+    if (
+        not isinstance(vector, list)
+        or len(vector) != 3
+        or any(type(value) is not int or not -(2**31) <= value < 2**31 for value in vector)
+    ):
+        raise ValueError("underside_center_to_imu_um must contain three signed int32 micrometre values")
+    return tuple(value / 1e6 for value in vector)
+
+
 def _vector(values):
     values = tuple(float(v) for v in values)
     if len(values) != 3 or not all(math.isfinite(v) for v in values):
@@ -20,6 +35,17 @@ class Mount:
 
     offset_m: tuple = (0.0, 0.0, 0.0)
     board_to_chassis: tuple = IDENTITY
+
+    @classmethod
+    def from_board_center(cls, center_m, board_to_chassis=IDENTITY, *, center_to_imu_m):
+        """Place the underside center using the selected profile's board-frame sensor vector."""
+        board = cls(center_m, board_to_chassis)
+        local = _vector(center_to_imu_m)
+        chip = tuple(
+            center + sum(a * b for a, b in zip(row, local))
+            for center, row in zip(board.offset_m, board.board_to_chassis)
+        )
+        return cls(chip, board.board_to_chassis)
 
     def __post_init__(self):
         offset = _vector(self.offset_m)
