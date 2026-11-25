@@ -10,6 +10,44 @@ The build stages generated headers from the selected firmware checkout and its
 Rebuild after changing firmware or commands; editing the packaged JSON alone does
 not change the compiled firmware. No SDK or firmware sources are rewritten.
 
+## Physical IMU installation
+
+The normal executable accepts the chip position relative to the chassis origin
+and a rigid board-to-chassis rotation. Offsets use metres in forward/left/up
+coordinates. The rotation is row-major, maps board coordinates to chassis
+coordinates, and must be finite, orthonormal and right-handed (tolerance 1e-6).
+
+```powershell
+.\build\native\kinisi-sim.exe --imu-offset-m "0,-0.1,0" --imu-board-to-chassis "1,0,0,0,1,0,0,0,1"
+```
+
+This example places the chip 100 mm right of the chassis origin. The native
+no-slip motor/shaft plant adds tangential and centripetal acceleration at that
+point, rotates the specific force and angular rate into board axes, then uses
+the existing v0.4 chip convention `(-board X, -board Y, +board Z)` inside the
+BMI088 model. A static tilted installation starts at its projected gravity.
+An offset in height does not add rotational acceleration for planar yaw alone.
+These options also apply to `--stdio-test`. The centered identity default keeps
+the previous sensor stream unchanged. Explicit physical mount options require
+an IMU-equipped board; v0.3/Nano still start normally without them.
+
+The Python native adapter has the same physical boundary:
+
+```python
+from kinisi_virtual_board import FirmwareBoard
+from kinisi_virtual_board.imu_mount import Mount
+
+with FirmwareBoard(imu_mount=Mount(offset_m=(0, -0.1, 0))) as board:
+    board.advance(0.1)
+```
+
+Alternatively call `board.set_imu_mount(offset_m, board_to_chassis)` before
+advancing the clock. The matrix is a nested 3x3 tuple. Reconfiguration after
+time starts or after exact input injection is rejected. `set_imu` continues to
+accept exact native chip-axis samples, bypassing the physical mount model.
+Neither physical interface declares a mount to a firmware estimator or changes
+its configuration. Firmware/SDK mount commands remain a separate declaration.
+
 ## Linux
 
 ```bash

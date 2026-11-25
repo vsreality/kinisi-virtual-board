@@ -8,6 +8,7 @@ import tempfile
 import unittest
 
 from kinisi_virtual_board import Schema, VirtualBoard
+from kinisi_virtual_board.imu_mount import Mount
 
 COMMANDS = Path(os.environ.get("KINISI_COMMANDS", Path(__file__).resolve().parents[2] / "kinisi-motor-controller-firmware" / "commands.json"))
 
@@ -269,6 +270,20 @@ class BoardTests(unittest.TestCase):
         self.assertAlmostEqual(values[5], .5, delta=.05)
         self.assertAlmostEqual(values[2], 9.80665, delta=.5)
 
+    def test_mounted_physical_sensor_and_raw_override_on_wire(self):
+        mount = Mount((0., -.1, 0.), ((1, 0, 0), (0, 0, -1), (0, 1, 0)))
+        with self.assertRaisesRegex(ValueError, "BMI088"):
+            VirtualBoard(COMMANDS, revision="0.3.0", imu_mount=mount)
+        self.board = VirtualBoard(COMMANDS, imu_mount=mount)
+        self.initialize()
+        self.board.advance(.3)
+        acceleration = struct.unpack("<6d", self.ok("GET_IMU"))[:3]
+        for actual, expected in zip(acceleration, (0., -9.80665, 0.)):
+            self.assertAlmostEqual(actual, expected, delta=.5)
+        self.board.set_imu((1, 2, 3), (4, 5, 6))
+        self.board.advance(.1)
+        self.assertEqual(struct.unpack("<6d", self.ok("GET_IMU")), (1, 2, 3, 4, 5, 6))
+
     def test_bmi088_watchdog_stop_preserves_sensor_step_cadence(self):
         one = VirtualBoard(COMMANDS)
         many = VirtualBoard(COMMANDS)
@@ -397,7 +412,8 @@ class BoardTests(unittest.TestCase):
                                       "GET_IMU_TRACKING_CONFIGURATION", "SET_FEEDBACK_SOURCE",
                                       "GET_FEEDBACK_SOURCE_STATUS", "GET_FEEDBACK_SOURCE_VECTOR",
                                       "SET_FEEDBACK_FUSION_MOUNT", "GET_FEEDBACK_FUSION_MOUNT",
-                                      "GET_FEEDBACK_SOURCE_HEALTH", "GET_FEEDBACK_IMU_CHANNELS")
+                                      "GET_FEEDBACK_SOURCE_HEALTH", "GET_FEEDBACK_IMU_CHANNELS",
+                                      "SET_IMU_MOUNT", "GET_IMU_MOUNT")
                      if name in self.board.schema.commands]
         self.assertEqual(self.board.unsupported_commands, sorted(expected))
 

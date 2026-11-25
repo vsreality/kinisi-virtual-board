@@ -8,6 +8,7 @@ register value of each die. Digital delivery belongs to the caller.
 import hashlib
 import math
 import operator
+from .imu_mount import Mount
 
 MODEL_ID = "bmi088-v04-1"
 G = 9.80665
@@ -38,14 +39,19 @@ class _Random:
 
 
 class BMI088:
-    def __init__(self, seed=1, temperature_c=25., *, noise_seed=None):
+    def __init__(self, seed=1, temperature_c=25., *, noise_seed=None, mount=None):
         if not -40 <= temperature_c <= 85:
             raise ValueError("BMI088 operating temperature must be -40 to 85 C")
         seed = operator.index(seed)
         if not 0 <= seed <= 0xffffffff:
             raise ValueError("BMI088 seed must be an unsigned 32-bit integer")
         unit_rng = _Random(seed)
-        self._signal = [0., 0., G, 0., 0., 0.]
+        if mount is not None and not isinstance(mount, Mount):
+            raise TypeError("mount must be a Mount")
+        self.mount = mount
+        self._previous_yaw_rate = 0.
+        gravity = mount.to_board((0., 0., G)) if mount is not None else (0., 0., G)
+        self._signal = [sign * v for sign, v in zip(MOUNT, gravity)] + [0.] * 3
         self._noise = [0.] * 6
         self.values = [0.] * 6
         self.bias = []
@@ -66,7 +72,7 @@ class BMI088:
         self._now = 0
         self._next = [PERIOD_US, PERIOD_US + 2500]
 
-    def advance(self, at_us, body_accel=(0., 0., G), body_gyro=(0., 0., 0.)):
+    def advance(self, at_us, body_accel=(0., 0., G), body_gyro=(0., 0., 0.), *, yaw_acceleration=None):
         at_us = operator.index(at_us)
         if at_us < self._now:
             raise ValueError("BMI088 time must be monotonic")
@@ -74,6 +80,16 @@ class BMI088:
             raise ValueError("BMI088 inputs require three axes per die")
         if not all(math.isfinite(v) for v in (*body_accel, *body_gyro)):
             raise ValueError("BMI088 inputs must be finite")
+        if yaw_acceleration is not None and not math.isfinite(yaw_acceleration):
+            raise ValueError("Yaw acceleration must be finite")
+        if self.mount is not None:
+            if at_us == self._now:
+                return
+            if yaw_acceleration is None:
+                yaw_acceleration = (body_gyro[2] - self._previous_yaw_rate) * 1e6 / (at_us - self._now)
+            yaw_rate = body_gyro[2]
+            body_accel, body_gyro = self.mount.chip_inputs(body_accel, body_gyro, yaw_acceleration)
+            self._previous_yaw_rate = yaw_rate
         for die, inputs in enumerate((body_accel, body_gyro)):
             target = tuple(sign * value for sign, value in zip(MOUNT, inputs))
             start = self._now

@@ -112,6 +112,18 @@ For an integrated release, replay the captured health packets through the matchi
 Two cases exercise commands that crossed an encoder fault. A fragmented chassis START spans timer recovery. A standalone motor switches to a healthy encoder while a target is already buffered behind the reconfiguration request. Both stale requests must be rejected. The standalone motor must coast until a fresh target arrives on its new binding.
 
 
+## Physical mounting qualification
+
+From a clean simulator checkout, pass a v0.4 firmware checkout with protocol 2.23 physical mount support and a new output directory:
+
+```sh
+python -B -m kinisi_virtual_board mounting-acceptance --firmware /path/to/firmware --out /path/to/new-mounting-results
+```
+
+The fixture measures to the BMI088 chip in chassis metres and uses a board-to-chassis rotation. It exercises centered, left, right, four vertical orientations, inverted, and combined offset/angle installations. Each installation sees rest, forward acceleration, a turn reaching constant rate and a changing-rate turn in both IMU-only and passive fused tracking. Additional cases cover a 2 rad/s right-offset turn and persistent contradictory wheel and inertial readings. Registration, saved readback, reboot and disarmed outputs use the real native firmware. The sensor plant supplies independently timed chip-axis values. The scorer compares the reported chassis-origin pose and twist against the maneuver at each observed source timestamp.
+
+The one-second error limits are 0.050 m planar position, 0.020 m/s planar velocity, 2° relative yaw and 0.020 rad/s yaw rate. `plan.json` fixes the sensor seed, timing and planned coverage before cases execute. `summary.json` links outcomes to the individual captures and scoring evidence. Exit 0 means the requested cases passed, 1 indicates a measured failure, and 2 indicates incomplete evidence. A focused `--case` run covers just its named cases. Repeat the centered IMU regression and fault checks on the same firmware for compatibility. [Sensor model and serving flags](bmi088.md)
+
 ## Public IMU regression
 
 For ordinary v0.4 IMU development and release checks, run one command from the

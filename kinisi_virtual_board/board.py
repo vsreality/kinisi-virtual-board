@@ -66,7 +66,7 @@ class Encoder:
 
 class VirtualBoard:
     def __init__(self, commands, board_profile=None, *, revision="0.4.0", pwm_speed=10.0, imu_seed=1,
-                 temperature_c=25.0):
+                 temperature_c=25.0, imu_mount=None):
         self.schema = commands if isinstance(commands, Schema) else Schema(commands)
         self.profile = json.loads(Path(board_profile).read_text()) if board_profile else None
         if self.profile:
@@ -96,7 +96,10 @@ class VirtualBoard:
         self.platform_target = None
         self.temperature = 25.0
         self.imu = dict(zip((p["name"] for p in self.schema.objects["imu_sample"]), (0., 0., 9.80665, 0., 0., 0.)))
-        self.imu_model = BMI088(imu_seed, temperature_c=temperature_c) if self.revision == (0, 4, 0) and self.sensor_counts["imu"] else None
+        has_imu = self.revision == (0, 4, 0) and self.sensor_counts["imu"]
+        if imu_mount is not None and not has_imu:
+            raise ValueError("A physical IMU mount requires a board with a BMI088")
+        self.imu_model = BMI088(imu_seed, temperature_c=temperature_c, mount=imu_mount) if has_imu else None
         self._imu_generated = dict(self.imu)
         self._imu_override = False
         self._imu_velocity = (0., 0., 0.)

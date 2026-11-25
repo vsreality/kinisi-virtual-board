@@ -10,6 +10,7 @@ import weakref
 
 from .firmware_build import DEFAULT_FIRMWARE, build_firmware
 from .schema import Schema
+from .imu_mount import Mount
 
 
 def _release(library, folder, dll_directory):
@@ -39,7 +40,8 @@ class FirmwareBoard:
 
     def __init__(self, commands=None, *, firmware=DEFAULT_FIRMWARE, revision="0.4.0",
                  compiler=None, max_speed=10.0, time_constant=0.05, encoder_motors=(0, 1, 2, 3),
-                 fram_image=None, fram_read_failure=False, imu_seed=1, temperature_c=25.0):
+                 fram_image=None, fram_read_failure=False, imu_seed=1, temperature_c=25.0,
+                 imu_mount=None):
         self.schema = commands if isinstance(commands, Schema) else Schema(commands or Path(firmware) / "commands.json")
         if not math.isfinite(max_speed) or max_speed <= 0 or not math.isfinite(time_constant) or time_constant <= 0:
             raise ValueError("Plant max_speed and time_constant must be finite and positive")
@@ -49,6 +51,10 @@ class FirmwareBoard:
             raise ValueError("imu_seed must be an unsigned 32-bit integer")
         if not math.isfinite(temperature_c) or not -40 <= temperature_c <= 85:
             raise ValueError("BMI088 operating temperature must be -40 to 85 C")
+        if imu_mount is not None and not isinstance(imu_mount, Mount):
+            raise TypeError("imu_mount must be a Mount")
+        if imu_mount is not None and revision != "0.4.0":
+            raise ValueError("Physical IMU mount requires a board with an IMU")
         if fram_image is not None:
             fram_image = bytes(fram_image)
             if len(fram_image) != self.FRAM_SIZE:
@@ -92,6 +98,7 @@ class FirmwareBoard:
             "reverse": (ct.c_int, (ct.c_uint8,)), "mode": (ct.c_int, (ct.c_uint8,)),
             "temperature": (None, (ct.c_double, ct.c_int)),
             "imu_configure": (ct.c_int, (ct.c_uint32, ct.c_double)),
+            "imu_mount": (ct.c_int, (ct.POINTER(ct.c_double), ct.POINTER(ct.c_double))),
             "imu_observation": (None, (ct.POINTER(ct.c_double), ct.c_int, ct.c_uint64, ct.c_uint64)),
             "current": (None, (ct.c_uint8, ct.c_double, ct.c_int)),
             "fault": (None, (ct.c_uint8, ct.c_int)),
@@ -126,6 +133,13 @@ class FirmwareBoard:
             self.close()
             raise ValueError("Unable to configure native IMU before startup")
         self._lib.sim_init()
+        self.imu_mount = None
+        if imu_mount is not None:
+            try:
+                self.set_imu_mount(imu_mount.offset_m, imu_mount.board_to_chassis)
+            except BaseException:
+                self.close()
+                raise
 
     @property
     def fram_image(self):
@@ -356,10 +370,48 @@ class FirmwareBoard:
             self._check_open()
             self._lib.sim_temperature(celsius, status)
 
+    def set_imu_mount(
+        self,
+        offset_m=(0., 0., 0.),
+        board_to_chassis=((1., 0., 0.), (0., 1., 0.), (0., 0., 1.)),
+    ):
+        """Set physical model geometry at clock zero, before exact injection.
+
+        Offset is metres from the chassis origin to the chip in forward/left/up
+        axes. The nested 3x3 proper rotation maps board axes into chassis axes.
+        This changes generated physical readings, never estimator configuration.
+        Exact set_imu values are already chip axes and bypass this model entirely.
+        """
+        try:
+            offset = tuple(float(x) for x in offset_m)
+            matrix = tuple(tuple(float(x) for x in row) for row in board_to_chassis)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("IMU mount requires a 3-vector and nested 3x3 rotation") from exc
+        if (len(offset) != 3 or len(matrix) != 3
+                or any(len(row) != 3 for row in matrix)):
+            raise ValueError("IMU mount requires a 3-vector and nested 3x3 rotation")
+        values = tuple(x for row in matrix for x in row)
+        if not all(math.isfinite(x) for x in (*offset, *values)):
+            raise ValueError("IMU mount must be finite")
+        mount = Mount(offset, matrix)
+        with self._lock:
+            self._check_open()
+            if self.revision != (0, 4, 0):
+                raise ValueError("Physical IMU mount requires a board with an IMU")
+            accepted = self._lib.sim_imu_mount(
+                (ct.c_double * 3)(*offset), (ct.c_double * 9)(*values)
+            )
+            if not accepted:
+                raise ValueError(
+                    "IMU mount requires clock zero, model ownership and a proper rigid rotation"
+                )
+            self.imu_mount = mount
+
     def set_imu(self, acceleration=(0., 0., 9.80665), angular_velocity=(0., 0., 0.), *,
                 status=0, accel_us=None, gyro_us=None):
         """Switch from the BMI088 model to exact, latched observation injection.
 
+        Values are native chip axes, bypassing any physical mount transform.
         Values, status and acquisition times remain fixed until the next call.
         Omitted acquisition times use the current board clock. The external
         chassis uses this path to deliver its independently sampled IMU model.

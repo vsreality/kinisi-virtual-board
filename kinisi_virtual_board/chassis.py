@@ -58,12 +58,13 @@ class VirtualIMU:
 
     For sample identity or delivery timing use BMI088.advance directly.
     """
-    def __init__(self, seed, *, noise_seed=None):
-        self.sensor = BMI088(seed, noise_seed=noise_seed)
+    def __init__(self, seed, *, noise_seed=None, mount=None):
+        self.sensor = BMI088(seed, noise_seed=noise_seed, mount=mount)
         self.bias = self.sensor.bias
         self._at_us = 2500
 
-    def sample(self, specific_force, yaw_rate):
+    def sample(self, specific_force, yaw_rate, *, yaw_acceleration=None):
         self._at_us += PERIOD_US
-        self.sensor.advance(self._at_us, specific_force, (0., 0., yaw_rate))
+        self.sensor.advance(self._at_us, specific_force, (0., 0., yaw_rate),
+                            yaw_acceleration=yaw_acceleration)
         return list(self.sensor.values)

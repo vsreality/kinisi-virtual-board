@@ -33,6 +33,7 @@ static uint64_t next_health_poll;
 #include <setjmp.h>
 #include <string.h>
 #include "bmi088_model.h"
+#include "sim_imu_mount.h"
 
 _Static_assert(sizeof(double) == 8, "Kinisi wire format requires 64-bit doubles");
 
@@ -95,6 +96,21 @@ static bool imu_injected, imu_started;
 static double shaft_velocity[4];
 static platform_odometry_t previous_body_velocity;
 static double body_acceleration[3] = {0., 0., 9.80665}, body_gyro[3];
+static double body_yaw_acceleration;
+static sim_imu_mount_t physical_imu_mount = IMU_MOUNT_IDENTITY;
+
+static void imu_mount_initial_gravity(void) {
+    if (physical_imu_mount.centered_identity) {
+        return;
+    }
+    const double gravity[3] = {0., 0., BMI088_G}, stopped[3] = {0., 0., 0.};
+    double acceleration[3], gyro[3];
+    sim_mount_apply(&physical_imu_mount, gravity, stopped, 0., acceleration, gyro);
+    /* bmi088_model owns the existing board-to-chip axis convention. */
+    for (unsigned i = 0; i < 3; ++i) {
+        imu_model.signal[i] = i == 2 ? acceleration[i] : -acceleration[i];
+    }
+}
 static hw_motor_faults_t faults[4];
 static uint32_t fault_sequence[4];
 static hw_motor_current_limit_t limits[4];
@@ -377,6 +393,7 @@ bool sim_usb_send(uint8_t *data, uint8_t length) {
 }
 API void sim_init(void) {
     bmi088_init(&imu_model, imu_seed, imu_temperature_c);
+    imu_mount_initial_gravity();
     imu_started = true;
 #ifdef SIM_TRACKING_HEALTH
     feedback_health_install(read_health, encoder_sampling_valid);
@@ -436,10 +453,18 @@ API int sim_poll(uint64_t time_us) {
             platform_odometry_t body = platform_update_odometry(indexes, wheels, 4);
             body_acceleration[0] = (body.x - previous_body_velocity.x) / dt - body.t * body.y;
             body_acceleration[1] = (body.y - previous_body_velocity.y) / dt + body.t * body.x;
+            body_yaw_acceleration = (body.t - previous_body_velocity.t) / dt;
             body_gyro[2] = body.t;
             previous_body_velocity = body;
         }
-        bmi088_advance(&imu_model, now_us, body_acceleration, body_gyro);
+        if (physical_imu_mount.centered_identity) {
+            bmi088_advance(&imu_model, now_us, body_acceleration, body_gyro);
+        } else {
+            double acceleration[3], gyro[3];
+            sim_mount_apply(&physical_imu_mount, body_acceleration, body_gyro,
+                            body_yaw_acceleration, acceleration, gyro);
+            bmi088_advance(&imu_model, now_us, acceleration, gyro);
+        }
         memcpy(&imu, imu_model.values, sizeof(imu));
         imu_accel_us = imu_model.accel_us;
         imu_gyro_us = imu_model.gyro_us;
@@ -562,6 +587,20 @@ API int sim_imu_configure(uint32_t seed, double temperature_c) {
     if (imu_started || !isfinite(temperature_c) || temperature_c < -40. || temperature_c > 85.) return 0;
     imu_seed = seed;
     imu_temperature_c = temperature_c;
+    return 1;
+}
+API int sim_imu_mount(const double *offset_m, const double *board_to_chassis) {
+    if (!NUMBER_IMU_SENSORS || now_us || imu_injected ||
+        !sim_mount_set(&physical_imu_mount, offset_m, board_to_chassis)) {
+        return 0;
+    }
+    if (imu_started) {
+        /* Changing setup at clock zero must also undo a previous tilted setup. */
+        imu_model.signal[0] = 0.;
+        imu_model.signal[1] = 0.;
+        imu_model.signal[2] = BMI088_G;
+        imu_mount_initial_gravity();
+    }
     return 1;
 }
 API void sim_imu_observation(const double *values, int status, uint64_t accel_us, uint64_t gyro_us) {

@@ -38,6 +38,7 @@ public:
     int (*mode)(uint8_t);
     void (*encoder)(uint8_t, uint16_t);
     void (*shaft_velocity)(const double*);
+    int (*imu_mount)(const double*, const double*);
     explicit Firmware(const std::filesystem::path& file) {
 #ifdef _WIN32
         handle_ = LoadLibraryExW(std::filesystem::absolute(file).c_str(), nullptr,
@@ -51,6 +52,7 @@ public:
             LOAD(init); LOAD(feed); LOAD(poll); LOAD(read); LOAD(deadline); LOAD(disconnect);
             LOAD(lost); LOAD(pwm); LOAD(resolution); LOAD(reverse); LOAD(mode); LOAD(encoder);
             LOAD(shaft_velocity);
+            LOAD(imu_mount);
 #undef LOAD
             init();
         } catch (...) { unload(); throw; }

@@ -5,6 +5,7 @@ from pathlib import Path
 
 from . import Schema, TCPServer, VirtualBoard, FirmwareBoard
 from .native import PTYEndpoint, SerialEndpoint, serve_native
+from .imu_mount import IDENTITY, Mount
 
 
 def main():
@@ -15,6 +16,9 @@ def main():
     parser.add_argument("--compiler", help="Host GCC/Clang executable; defaults to CC or auto-detection")
     parser.add_argument("--commands", type=Path, help="Shared commands.json; defaults to --firmware/commands.json")
     parser.add_argument("--board-profile", type=Path, help="Optional firmware boards/v0.x.json")
+    parser.add_argument("--imu-offset-m", metavar="X,Y,Z", help="Physical chip position in chassis metres")
+    parser.add_argument("--imu-board-to-chassis", metavar="R00,...,R22",
+                        help="Physical board-to-chassis rotation, nine row-major values")
     parser.add_argument("--revision", default="0.4.0", choices=["0.3.0", "0.3.1", "0.4.0"])
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8766, help="0 chooses an available port")
@@ -47,7 +51,19 @@ def main():
     health.add_argument("--firmware", type=Path, required=True)
     health.add_argument("--out", type=Path, required=True, help="New directory for the summary and wire traces")
     health.add_argument("--compiler", default=argparse.SUPPRESS, help="Host GCC/Clang executable (or set CC)")
+    mounting = commands.add_parser("mounting-acceptance", help="Check physical IMU mounting against native origin tracking")
+    mounting.add_argument("--firmware", type=Path, required=True)
+    mounting.add_argument("--out", type=Path, required=True, help="New directory for frozen plan, wire traces and scores")
+    mounting.add_argument("--compiler", default=argparse.SUPPRESS)
+    mounting.add_argument("--development", action="store_true", help="Fingerprint uncommitted sources")
+    mounting.add_argument("--case", action="append", dest="cases", help="Select a declared case; repeat for several")
     args = parser.parse_args()
+    if args.command == "mounting-acceptance":
+        from .mounting_acceptance import run
+        try:
+            return run(args)
+        except (OSError, ValueError, RuntimeError) as error:
+            parser.exit(2, f"Mounting acceptance incomplete: {error}\n")
     if args.command == "tracking-health":
         from .feedback_selector.health import run
         try:
@@ -73,12 +89,23 @@ def main():
         return status
     try:
         schema = Schema(args.commands or args.firmware / "commands.json")
+        mount = None
+        if args.imu_offset_m is not None or args.imu_board_to_chassis is not None:
+            offset = args.imu_offset_m.split(",") if args.imu_offset_m is not None else (0., 0., 0.)
+            matrix = IDENTITY
+            if args.imu_board_to_chassis is not None:
+                values = args.imu_board_to_chassis.split(",")
+                if len(values) != 9:
+                    raise ValueError("--imu-board-to-chassis requires nine row-major values")
+                matrix = (values[:3], values[3:6], values[6:])
+            mount = Mount(offset, matrix)
         if args.backend == "firmware" and args.board_profile:
             raise ValueError("The firmware backend uses --firmware/boards and --revision; --board-profile is only for the Python model")
         def factory():
             if args.backend == "firmware":
-                return FirmwareBoard(schema, firmware=args.firmware, revision=args.revision, compiler=args.compiler)
-            return VirtualBoard(schema, args.board_profile, revision=args.revision)
+                return FirmwareBoard(schema, firmware=args.firmware, revision=args.revision,
+                                     compiler=args.compiler, imu_mount=mount)
+            return VirtualBoard(schema, args.board_profile, revision=args.revision, imu_mount=mount)
         board = factory()
     except (OSError, ValueError, KeyError, RuntimeError) as error:
         parser.error(str(error))
@@ -87,6 +114,8 @@ def main():
               "unsupported_commands": board.unsupported_commands}
     if args.backend == "firmware":
         report["native_build"] = board.build
+    if mount is not None:
+        report["physical_imu_mount"] = dict(offset_m=mount.offset_m, board_to_chassis=mount.board_to_chassis)
     if args.check:
         print(json.dumps(report, indent=2))
         if hasattr(board, "close"):

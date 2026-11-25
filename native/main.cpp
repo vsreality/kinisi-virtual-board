@@ -6,6 +6,7 @@
 #include <iostream>
 #include <thread>
 #include <vector>
+#include <sstream>
 #ifdef _WIN32
 #include <io.h>
 #include <fcntl.h>
@@ -13,6 +14,29 @@
 
 static volatile std::sig_atomic_t stopping=0;
 static void stop(int) { stopping=1; }
+
+template<size_t N> static std::array<double, N> mount_numbers(const std::string& text) {
+    std::array<double, N> values{};
+    std::istringstream stream(text);
+    std::string item;
+    if (text.empty() || text.back() == ',') {
+        throw std::runtime_error("Malformed IMU mount vector");
+    }
+    for (size_t i = 0; i < N; ++i) {
+        if (!std::getline(stream, item, ',')) {
+            throw std::runtime_error("Wrong IMU mount component count");
+        }
+        size_t used = 0;
+        values[i] = std::stod(item, &used);
+        if (used != item.size() || !std::isfinite(values[i])) {
+            throw std::runtime_error("IMU mount components must be finite numbers");
+        }
+    }
+    if (std::getline(stream, item, ',')) {
+        throw std::runtime_error("Wrong IMU mount component count");
+    }
+    return values;
+}
 
 // Binary deterministic test interface: op:u8, length:u32 LE, payload.
 // F feeds wire bytes, A advances by u64 microseconds, D disconnects, Q quits.
@@ -57,18 +81,34 @@ int main(int argc,char** argv) {
         std::filesystem::path library=directory/"firmware.so";
 #endif
         bool test=false;
+        bool mounted = false;
+        std::array<double, 3> imu_offset{};
+        std::array<double, 9> imu_rotation{1., 0., 0., 0., 1., 0., 0., 0., 1.};
         for(int i=1;i<argc;++i) {
             std::string option=argv[i];
             if(option=="--stdio-test")test=true;
             else if(option=="--library" && i+1<argc)library=argv[++i];
+            else if (option == "--imu-offset-m" && i + 1 < argc) {
+                imu_offset = mount_numbers<3>(argv[++i]);
+                mounted = true;
+            }
+            else if (option == "--imu-board-to-chassis" && i + 1 < argc) {
+                imu_rotation = mount_numbers<9>(argv[++i]);
+                mounted = true;
+            }
             else if(option=="--help") {
                 std::cout<<"Kinisi standalone firmware simulator\n"
                   "  kinisi-sim [--library PATH]\n"
                   "Creates one Windows COM device (installed Kinisi driver required) or Linux PTY.\n"
+                  "  --imu-offset-m x,y,z   chip position in chassis forward/left/up metres\n"
+                  "  --imu-board-to-chassis r00,r01,...,r22   proper rotation, row-major\n"
                   "  --stdio-test   deterministic binary test interface\n";return 0;
             } else throw std::runtime_error("Unknown option: "+option);
         }
         Firmware firmware(library);Plant plant(firmware);
+        if (mounted && !firmware.imu_mount(imu_offset.data(), imu_rotation.data())) {
+            throw std::runtime_error("IMU mount requires an IMU board and a proper orthonormal rotation");
+        }
         if(test)return stdio_test(firmware,plant);
         auto port=open_port();
         std::signal(SIGINT,stop);std::signal(SIGTERM,stop);
