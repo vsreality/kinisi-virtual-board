@@ -16,6 +16,7 @@ platform kinematics and subscriptions.
 | Motor velocity/position PID | Firmware `controllers_manager.c` and `lib/libcontrollers` |
 | Platform kinematics and position control | Firmware differential/omni/mecanum/platform-position sources |
 | Encoder and world odometry | Firmware odometry manager, encoder odometry and integrator |
+| Configuration save and boot restore | Firmware `controller_configuration.c` and `lib/config_store` |
 | Motor, encoder, GPIO and sensor interfaces | Native shim in `firmware_support/runtime.c` |
 | Motor response and clock advancement | Python `firmware.py` |
 | COM/TTY, PTY and TCP | Python endpoint adapters |
@@ -87,6 +88,44 @@ board calls are serialized with a reentrant lock. Use `port.advance()` while an
 SDK reader thread is active. `VirtualSerial.close()` disconnects the session;
 the caller retains ownership of the board and closes it separately.
 
+## Saved configuration and virtual cold boots
+
+With firmware protocol 2.14, the native backend runs the production configuration
+capture, FRAM journal, CRC/board/version checks and restore path. Only the FRAM
+hardware boundary is replaced with an 8192-byte array. Restore runs before the
+native connection is initialized, matching the command task's ordering.
+
+`board.fram_image` returns the complete storage image. Pass those bytes to a new
+`FirmwareBoard(fram_image=image)` to simulate a cold restart. The new board loads
+an independent shared library with fresh C runtime state; only FRAM is retained.
+`disconnect()` is a connection change and does not perform a boot or restore.
+Without an image, FRAM starts erased. To retain it between processes, write the
+image to a binary file and read it into the next constructor. Standalone serial
+processes do not automatically retain FRAM across launches.
+
+`set_fram_fault(write_after_bytes=N)` interrupts writes after N bytes across
+transactions, preserving partial writes for the subsequent cold boot.
+`set_fram_fault(read_failure=True)` makes storage reads fail without mutation;
+the constructor also accepts `fram_read_failure=True` to test boot failure.
+Calling `set_fram_fault()` clears both faults. `fram_transactions` returns read
+and write transaction counts, allowing unsupported profiles to prove they never
+access storage. Storage snapshots bypass injected bus failures for inspection.
+
+Run the production-path regressions with:
+
+```powershell
+python -m unittest discover -s tests -p test_configuration.py -v
+```
+
+The tests exercise differential, omni and mecanum setup, independent encoder
+scales/directions, PWM selection, unsaved edits, reconnect, stopped restoration,
+every byte boundary of interrupted replacement saves, invalid records, read
+failures and unsupported boards. A separate-process test saves a binary image
+and starts another Python process with a fresh firmware library, checking that
+configuration survives but motor outputs, time and controller activity do not.
+This verifies application logic, not physical FRAM retention, I²C behavior,
+STM32 startup, electrical timing or MCU stack/resource use.
+
 Controller and odometry tasks run cooperatively. The shim yields at their
 `vTaskDelayUntil` boundaries using the approach in the firmware's host tests.
 It primes each task at creation, then runs it at its requested virtual deadline.
@@ -135,8 +174,11 @@ board.drop_next_reply("PING")                    # Executes; reply is lost
 Sensor methods accept optional hardware `status` integers: temperature/IMU use
 0=OK, 1=unavailable, 2=not-ready, 3=I/O-error; current uses 0=OK, 1=unavailable,
 2=out-of-range, 3=I/O-error. The shim models initial temperature and IMU settling
-at 300 ms and 50 ms. It does not reproduce sensor conversion cadence or recovery
-transactions. v0.3 reports sensors/driver functions absent per its board definition.
+at 300 ms and 50 ms. On v0.4 the automatic BMI088 producer samples accel and gyro
+independently. `set_imu` selects exact injected readings for that board instance.
+Temperature conversion cadence and bus recovery are outside the shim.
+v0.3 reports sensors/driver functions absent per its board definition.
+[BMI088 settings and timing](bmi088.md)
 
 Faults feed real command/controller checks and event subscription sequences.
 The driver itself is simulated: clearing faults succeeds for an initialized
@@ -178,3 +220,62 @@ exercised. The Windows COM-pair test remains opt-in because no virtual pair is
 installed. Node is absent in Linux here, so its JavaScript integration skips.
 Firmware/SDK schemas and generated artifacts are unchanged; the synchronization
 audit covers all three SDKs, including Arduino.
+
+
+## Driver sleep on v0.4
+
+With a firmware checkout that exposes `SET_DRIVER_SLEEP`, the v0.4 build links
+production `hw_motor.c` and `hw_drv8873.c`. The plant reads the resulting GPIO
+and timer states, including the 840-step PWM duty. Each simulated driver has
+its own SPI register bank. Asserting sleep clears its registers. The host uses
+the firmware's motor-control test HAL header for the peripheral declarations.
+HAL delays consume no wall time, so this tests command sequencing and readback;
+wake timing, electrical behavior and current draw require hardware.
+
+Run `python -m unittest discover -s tests -p test_driver_sleep.py -v` against
+protocol 2.15 firmware. In the Python harness,
+`board.set_wake_readback_failure(2)` corrupts channel 2's current-limit register
+on write. Pass `False` as the second argument to allow verified writes again.
+The injection applies during initialization as well as wake.
+
+## DRV8870 sleep on original v0.3 and Nano
+
+With protocol 2.17 firmware, select `--revision 0.3.0` for the original board or
+`--revision 0.3.1` for Nano. Both execute the firmware motor driver. The 0.3.0
+build uses PA9/TIM1_CH2 for M3 IN2. Nano uses PA10/TIM1_CH3 and reserves PA9
+for USB sensing. The native host supplies USB attachment explicitly.
+
+`FirmwareBoard.feed()` feeds the firmware USB command queue. On these profiles,
+`i2c_write(frame)` starts a transaction on the same board. To pause after a
+prefix, write the first bytes and then call `i2c_write(tail, start=False)`.
+Each `i2c_read()` requests one padded 256-byte reply through the firmware slave
+callbacks. An empty result means the simulated master received no frame.
+`set_usb_busy(True)` holds USB replies to exercise pending requests while the
+other session runs. The C++ serial endpoint uses the USB command session.
+
+`input_pad("A", 10)` returns the output source and high ticks per 840-count
+period, or `(None, None)` for an undriven or unmapped motor input.
+`timer_ticks(1, 3)` reads a regular timer compare and
+`pad_alternate_function("A", 10)` reports the selected pin mux.
+`low_dwell_ms` counts requested HAL delay while every motor input is a GPIO
+output reading low. After explicit release, a fresh brake produces high/high on
+the addressed channels. Ordinary coast produces low/low and permits immediate
+drive. These observations describe settled simulated outputs. Oscilloscope
+waveforms, transient timing, first-drive latency and current draw require hardware.
+
+## Shallow board idle on original v0.3 and Nano
+
+Protocol 2.18 enables the existing `SET_BOARD_IDLE` and `GET_BOARD_IDLE` commands
+on both DRV8870 revisions. Within an established USB session, a PING or time read
+is serviced while logical idle remains set. An interrupt may wake the physical CPU
+to handle work. An explicit `SET_BOARD_IDLE(0)` exits the protocol mode and
+restores the prior driver-inhibit policy. Outputs stay low until a fresh drive
+or brake command is accepted.
+
+The native tests run the production command and motor code. The motor HAL's
+`motor_pad_touched("A", 9)` records any GPIO configuration or write since boot,
+including a temporary one. Nano uses PA9 for VBUS and PA10 for M3 IN2. Its USB
+attach/detach policy is exercised in the firmware host fixtures, including the
+Nano command task with the production USB lifecycle during an idle session. The simulator models settled pin outputs and protocol state. Embedded
+instruction selection, time in WFI, physical current and wake latency require
+separate evidence.

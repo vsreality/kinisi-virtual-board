@@ -15,13 +15,13 @@
 // One library per executable, one board per process. No Python runtime.
 class Firmware {
     void* handle_ = nullptr;
-    template<class T> T symbol(const char* name) {
+    template<class T> T symbol(const char* name, bool required = true) {
 #ifdef _WIN32
         auto value = reinterpret_cast<T>(GetProcAddress(static_cast<HMODULE>(handle_), name));
 #else
         auto value = reinterpret_cast<T>(dlsym(handle_, name));
 #endif
-        if (!value) throw std::runtime_error(std::string("Missing firmware API: ") + name);
+        if (!value && required) throw std::runtime_error(std::string("Missing firmware API: ") + name);
         return value;
     }
 public:
@@ -37,6 +37,9 @@ public:
     int (*reverse)(uint8_t);
     int (*mode)(uint8_t);
     void (*encoder)(uint8_t, uint16_t);
+    void (*shaft_velocity)(const double*);
+    int (*imu_mount)(const double*, const double*);
+    int (*imu_board_center)(const double*, const double*);
     explicit Firmware(const std::filesystem::path& file) {
 #ifdef _WIN32
         handle_ = LoadLibraryExW(std::filesystem::absolute(file).c_str(), nullptr,
@@ -49,6 +52,9 @@ public:
 #define LOAD(name) name = symbol<decltype(name)>("sim_" #name)
             LOAD(init); LOAD(feed); LOAD(poll); LOAD(read); LOAD(deadline); LOAD(disconnect);
             LOAD(lost); LOAD(pwm); LOAD(resolution); LOAD(reverse); LOAD(mode); LOAD(encoder);
+            LOAD(shaft_velocity);
+            LOAD(imu_mount);
+            imu_board_center = symbol<decltype(imu_board_center)>("sim_imu_board_center", false);
 #undef LOAD
             init();
         } catch (...) { unload(); throw; }

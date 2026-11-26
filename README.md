@@ -6,7 +6,8 @@ controllers, odometry, watchdog and telemetry code.
 
 The SDK connects to one serial device: a Linux PTY or a Windows COM port.
 The Windows endpoint uses the included UMDF driver. No COM pair or proxy process
-is needed. Python is used to build the simulator, not to run it.
+is needed. Python builds the standalone executable and also provides an
+in-process native firmware harness for regression tests.
 
 ## Build and run
 
@@ -37,6 +38,44 @@ The current driver targets Windows 11 x64.
 
 ## Test
 
+Run the [dual-source tracking health qualification](docs/release-test-plan.md#dual-source-tracking-health) to check how v0.4 reports encoder and IMU failures, persistent disagreement and recovery.
+
+For paired encoder and IMU fusion control tests, use the [six-arm native firmware comparison](tools/fusion_comparison/README.md). It takes explicit reference and candidate firmware checkouts and a public workload.
+
+From this checkout, run the public v0.4 IMU motion regression with Python 3.10+
+and a host GCC or Clang compiler:
+
+```sh
+python -m kinisi_virtual_board imu-regression --firmware ../kinisi-motor-controller-firmware
+```
+
+The command builds the selected firmware, drives its BMI088 input and compares
+reported pose and velocity to known motion. It prints a JSON report with the
+build, seed and per-case results. It runs locally without a serial driver or
+administrator access. See the [cases, limits and exit codes](docs/release-test-plan.md#public-imu-regression).
+
+For the full 144-case chassis qualification run
+`python -m kinisi_virtual_board imu-qualify --firmware ../kinisi-motor-controller-firmware`.
+It saves its public plan, sensor inputs and results automatically.
+[Qualification matrix and replay](docs/release-test-plan.md#full-public-imu-release-qualification)
+
+For Mini v0.4, run the PCB underside-center mounting qualification on protocol 2.24
+and the chip-referenced compatibility cases on protocol 2.23 or later.
+[Mounting cases and commands](docs/release-test-plan.md#physical-mounting-qualification)
+
+Run the eight native feedback source selector scenarios and export SDK packet
+examples with a clean candidate checkout:
+
+```sh
+python -m kinisi_virtual_board selector-regression --firmware ../kinisi-motor-controller-firmware --out build/selector-run
+```
+
+This covers migration, all three sources, switching, stale data and unsupported
+boards. [Selector cases, receipts and optional browser checks](docs/release-test-plan.md#feedback-source-selector-regression)
+
+Use the [controller firmware release test plan](docs/release-test-plan.md) for
+candidate builds, virtual-board regression, story checks and release evidence.
+
 ```powershell
 python -m unittest discover -s tests -v
 ```
@@ -52,6 +91,7 @@ hardware. Missing firmware handlers remain visible to tests.
 
 - [Standalone architecture, builds, driver setup and limits](docs/standalone.md)
 - [Python firmware harness and deterministic fault injection](docs/native-firmware.md)
+- [v0.4 BMI088 measurements, timing and model limits](docs/bmi088.md)
 - [Legacy Python serial endpoints](docs/serial.md)
 - [Legacy Python behavioral model](docs/python-model.md)
 

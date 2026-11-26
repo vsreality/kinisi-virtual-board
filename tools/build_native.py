@@ -39,7 +39,7 @@ def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--firmware",type=Path,default=DEFAULT_FIRMWARE)
     parser.add_argument("--commands",type=Path)
-    parser.add_argument("--revision",default="0.4.0",choices=["0.3.0","0.4.0"])
+    parser.add_argument("--revision",default="0.4.0",choices=["0.3.0","0.3.1","0.4.0"])
     parser.add_argument("--out",type=Path,default=ROOT/"build/native")
     parser.add_argument("--compiler",help="Host C compiler for production firmware")
     parser.add_argument("--cxx",help="Linux C++ compiler")

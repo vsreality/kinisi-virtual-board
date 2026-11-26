@@ -4,10 +4,13 @@ import math
 import os
 from pathlib import Path
 import struct
+import subprocess
+import sys
 import tempfile
 import unittest
 
 from kinisi_virtual_board import Schema, VirtualBoard
+from kinisi_virtual_board.imu_mount import Mount
 
 COMMANDS = Path(os.environ.get("KINISI_COMMANDS", Path(__file__).resolve().parents[2] / "kinisi-motor-controller-firmware" / "commands.json"))
 
@@ -234,13 +237,125 @@ class BoardTests(unittest.TestCase):
         self.error("GET_TEMPERATURE", "SAMPLE_NOT_AVAILABLE")
         self.board.advance(.3)
         self.assertEqual(struct.unpack("<d", self.ok("GET_TEMPERATURE"))[0], 25.)
-        self.assertEqual(struct.unpack("<6d", self.ok("GET_IMU"))[2], 9.80665)
+        imu = struct.unpack("<6d", self.ok("GET_IMU"))
+        self.assertAlmostEqual(imu[2], 9.80665, delta=.5)
+        self.assertEqual(imu, tuple(self.board.imu_model.values))
         self.error("GET_IMU", "SENSOR_NOT_AVAILABLE", sensor_index=1)
         self.board.sensor_errors["temperature", 0] = "INTERNAL_ERROR"
         self.error("GET_TEMPERATURE", "INTERNAL_ERROR")
         self.board = VirtualBoard(COMMANDS, revision="0.3.0")
         self.initialize()
         self.error("GET_TEMPERATURE", "SENSOR_NOT_AVAILABLE")
+
+    def test_default_bmi088_is_seeded_and_changes_at_rest(self):
+        self.initialize()
+        twin = VirtualBoard(COMMANDS, imu_seed=1)
+        other = VirtualBoard(COMMANDS, imu_seed=2)
+        readings = []
+        for _ in range(8):
+            self.board.advance(.05)
+            twin.advance(.05)
+            other.advance(.05)
+            values = struct.unpack("<6d", self.ok("GET_IMU"))
+            readings.append(values)
+            self.assertEqual(values, tuple(twin.imu.values()))
+            self.assertNotEqual(values, tuple(other.imu.values()))
+        self.assertGreater(len(set(readings)), 1)
+        self.assertTrue(all(abs(v[2]-9.80665) < .5 for v in readings))
+        self.assertIsNone(VirtualBoard(COMMANDS, revision="0.3.0").imu_model)
+
+    def test_bmi088_uses_planar_body_rotation(self):
+        self.initialize()
+        self.board.velocity = [0., 0., .5]
+        self.board.advance(.3)
+        values = struct.unpack("<6d", self.ok("GET_IMU"))
+        self.assertAlmostEqual(values[5], .5, delta=.05)
+        self.assertAlmostEqual(values[2], 9.80665, delta=.5)
+
+    def test_mounted_physical_sensor_and_raw_override_on_wire(self):
+        mount = Mount((0., -.1, 0.), ((1, 0, 0), (0, 0, -1), (0, 1, 0)))
+        with self.assertRaisesRegex(ValueError, "BMI088"):
+            VirtualBoard(COMMANDS, revision="0.3.0", imu_mount=mount)
+        self.board = VirtualBoard(COMMANDS, imu_mount=mount)
+        self.initialize()
+        self.board.advance(.3)
+        acceleration = struct.unpack("<6d", self.ok("GET_IMU"))[:3]
+        for actual, expected in zip(acceleration, (0., -9.80665, 0.)):
+            self.assertAlmostEqual(actual, expected, delta=.5)
+        self.board.set_imu((1, 2, 3), (4, 5, 6))
+        self.board.advance(.1)
+        self.assertEqual(struct.unpack("<6d", self.ok("GET_IMU")), (1, 2, 3, 4, 5, 6))
+
+    def test_serving_uses_the_selected_board_profile_for_center_geometry(self):
+        with tempfile.TemporaryDirectory() as directory:
+            profile = json.loads((COMMANDS.parent / "boards" / "v0.4.json").read_bytes())
+            profile["imu_geometry"] = {"underside_center_to_imu_um": [5000, -4000, 3000]}
+            selected = Path(directory) / "board.json"
+            selected.write_text(json.dumps(profile), encoding="utf8")
+            cmd = [sys.executable, "-B", "-m", "kinisi_virtual_board", "--backend", "python",
+                   "--commands", str(COMMANDS), "--board-profile", str(selected),
+                   "--imu-board-center-m=0,-0.1,0", "--imu-board-to-chassis=1,0,0,0,0,-1,0,1,0", "--check"]
+            check = subprocess.run(cmd, capture_output=True, text=True)
+            report = json.loads(check.stdout)
+            self.assertEqual(check.returncode, int(bool(report["unsupported_commands"])), check.stderr)
+            physical = report["physical_imu_mount"]
+            self.assertEqual(physical["board_center_m"], [0., -.1, 0.])
+            for value, expected in zip(physical["offset_m"], (.005, -.103, -.004)):
+                self.assertAlmostEqual(value, expected)
+            del profile["imu_geometry"]
+            selected.write_text(json.dumps(profile), encoding="utf8")
+            check = subprocess.run(cmd, capture_output=True, text=True)
+            self.assertEqual(check.returncode, 2)
+            self.assertIn("underside_center_to_imu_um", check.stderr)
+
+    def test_bmi088_watchdog_stop_preserves_sensor_step_cadence(self):
+        one = VirtualBoard(COMMANDS)
+        many = VirtualBoard(COMMANDS)
+        for board in (one, many):
+            board.velocity = [.5, 0., 0.]
+            board.heartbeat_enabled = True
+            board.heartbeat_timeout_ms = 100
+        one.advance(.5)
+        for _ in range(50):
+            many.advance(.01)
+        self.assertTrue(one.lost and many.lost)
+        self.assertEqual(one.velocity, [0., 0., 0.])
+        self.assertEqual(one.imu, many.imu)
+        self.assertEqual(one.imu_model.accel_us, many.imu_model.accel_us)
+        self.assertEqual(one.imu_model.gyro_us, many.imu_model.gyro_us)
+
+    def test_bmi088_temperature_is_separate_from_temperature_sensor_fixture(self):
+        hot = VirtualBoard(COMMANDS, temperature_c=85.)
+        nominal = VirtualBoard(COMMANDS, temperature_c=25.)
+        self.assertEqual(hot.temperature, 25.)
+        self.assertNotEqual(hot.imu_model.bias, nominal.imu_model.bias)
+        hot.temperature = 41.25
+        bias = tuple(hot.imu_model.bias)
+        hot.advance(.1)
+        self.assertEqual(tuple(hot.imu_model.bias), bias)
+        with self.assertRaises(ValueError):
+            VirtualBoard(COMMANDS, temperature_c=86.)
+
+    def test_explicit_imu_injection_and_mutable_dictionary_are_preserved(self):
+        self.initialize()
+        self.board.set_imu((1, 2, 3), (4, 5, 6))
+        self.board.advance(.3)
+        self.assertEqual(struct.unpack("<6d", self.ok("GET_IMU")), (1, 2, 3, 4, 5, 6))
+        self.board = VirtualBoard(COMMANDS)
+        self.initialize()
+        self.board.imu["acceleration_x"] = 2.5
+        expected = tuple(self.board.imu.values())
+        self.board.advance(.3)
+        self.assertEqual(struct.unpack("<6d", self.ok("GET_IMU")), expected)
+        self.board = VirtualBoard(COMMANDS)
+        self.initialize()
+        self.board.imu = dict(self.board.imu)
+        self.board.advance(.3)
+        self.assertEqual(struct.unpack("<6d", self.ok("GET_IMU")), (0., 0., 9.80665, 0., 0., 0.))
+        with self.assertRaises(ValueError):
+            self.board.set_imu((1, 2), (3, 4, 5))
+        with self.assertRaises(ValueError):
+            self.board.set_imu((float("nan"), 0, 0))
 
     def test_topic_subscription_and_unsubscribe(self):
         self.initialize()
@@ -313,7 +428,17 @@ class BoardTests(unittest.TestCase):
         expected = [
             "CLEAR_MOTOR_FAULTS", "GET_MOTOR_CURRENT", "GET_MOTOR_CURRENT_LIMIT",
             "GET_MOTOR_FAULTS", "SET_MOTOR_CURRENT_LIMIT", "SUBSCRIBE_CONFIGURED", "SUBSCRIBE_WITH_MODE"]
-        expected += [name for name in ("GET_PWM_FREQUENCY", "SET_PWM_FREQUENCY") if name in self.board.schema.commands]
+        expected += [name for name in ("GET_PWM_FREQUENCY", "SET_PWM_FREQUENCY",
+                                      "SAVE_CONFIGURATION", "GET_CONFIGURATION_FIELD", "SET_DRIVER_SLEEP", "GET_DRIVER_SLEEP",
+                                      "SET_BOARD_IDLE", "GET_BOARD_IDLE", "SET_FUSION_EXPERIMENT",
+                                      "GET_FUSION_STATUS", "GET_FUSION_VECTOR", "GET_FUSION_CONFIGURATION",
+                                      "SET_IMU_TRACKING", "GET_IMU_TRACKING_STATUS", "GET_IMU_TRACKING_VECTOR",
+                                      "GET_IMU_TRACKING_CONFIGURATION", "SET_FEEDBACK_SOURCE",
+                                      "GET_FEEDBACK_SOURCE_STATUS", "GET_FEEDBACK_SOURCE_VECTOR",
+                                      "SET_FEEDBACK_FUSION_MOUNT", "GET_FEEDBACK_FUSION_MOUNT",
+                                      "GET_FEEDBACK_SOURCE_HEALTH", "GET_FEEDBACK_IMU_CHANNELS",
+                                      "SET_IMU_MOUNT", "GET_IMU_MOUNT", "SET_BOARD_MOUNT", "GET_BOARD_MOUNT")
+                     if name in self.board.schema.commands]
         self.assertEqual(self.board.unsupported_commands, sorted(expected))
 
 

@@ -10,6 +10,7 @@ import weakref
 
 from .firmware_build import DEFAULT_FIRMWARE, build_firmware
 from .schema import Schema
+from .imu_mount import Mount
 
 
 def _release(library, folder, dll_directory):
@@ -31,14 +32,33 @@ class FirmwareBoard:
     16-bit encoder counts to the production controller/odometry tasks. This runs
     the firmware's C application, not the STM32 binary, HAL or real RTOS.
     Instances own independent shared libraries and must be closed after use.
+    The BMI088 uses imu_seed and temperature_c for a reproducible sensor unit.
+    Configured platforms assume no-slip wheels attached to their motor shafts;
+    without a platform it models a stationary bench. set_imu selects exact input.
     """
+    FRAM_SIZE = 8192
+
     def __init__(self, commands=None, *, firmware=DEFAULT_FIRMWARE, revision="0.4.0",
-                 compiler=None, max_speed=10.0, time_constant=0.05, encoder_motors=(0, 1, 2, 3)):
+                 compiler=None, max_speed=10.0, time_constant=0.05, encoder_motors=(0, 1, 2, 3),
+                 fram_image=None, fram_read_failure=False, imu_seed=1, temperature_c=25.0,
+                 imu_mount=None):
         self.schema = commands if isinstance(commands, Schema) else Schema(commands or Path(firmware) / "commands.json")
         if not math.isfinite(max_speed) or max_speed <= 0 or not math.isfinite(time_constant) or time_constant <= 0:
             raise ValueError("Plant max_speed and time_constant must be finite and positive")
         if len(encoder_motors) != 4 or any(type(i) is not int or not 0 <= i < 4 for i in encoder_motors):
             raise ValueError("encoder_motors must map each of the four encoders to a motor index")
+        if type(imu_seed) is not int or not 0 <= imu_seed < 2**32:
+            raise ValueError("imu_seed must be an unsigned 32-bit integer")
+        if not math.isfinite(temperature_c) or not -40 <= temperature_c <= 85:
+            raise ValueError("BMI088 operating temperature must be -40 to 85 C")
+        if imu_mount is not None and not isinstance(imu_mount, Mount):
+            raise TypeError("imu_mount must be a Mount")
+        if imu_mount is not None and revision != "0.4.0":
+            raise ValueError("Physical IMU mount requires a board with an IMU")
+        if fram_image is not None:
+            fram_image = bytes(fram_image)
+            if len(fram_image) != self.FRAM_SIZE:
+                raise ValueError(f"FRAM image must contain exactly {self.FRAM_SIZE} bytes")
         self.revision = tuple(map(int, revision.split(".")))
         self.max_speed, self.time_constant = max_speed, time_constant
         self.encoder_motors = tuple(encoder_motors)
@@ -70,17 +90,98 @@ class FirmwareBoard:
             "read": (ct.c_size_t, (ct.c_void_p, ct.c_size_t)),
             "disconnect": (None, ()), "lost": (ct.c_int, ()), "ready": (ct.c_int, ()),
             "drop": (None, (ct.c_uint8, ct.c_uint)), "encoder": (None, (ct.c_uint8, ct.c_uint16)),
+            "controller_dispatches": (ct.c_uint64, ()),
+            "encoder_sampling": (None, (ct.c_uint8, ct.c_int)),
+            "encoder_count": (ct.c_uint16, (ct.c_uint8,)),
+            "shaft_velocity": (None, (ct.POINTER(ct.c_double),)),
             "pwm": (ct.c_double, (ct.c_uint8,)), "resolution": (ct.c_double, (ct.c_uint8,)),
             "reverse": (ct.c_int, (ct.c_uint8,)), "mode": (ct.c_int, (ct.c_uint8,)),
             "temperature": (None, (ct.c_double, ct.c_int)),
-            "imu": (None, (ct.POINTER(ct.c_double), ct.c_int)),
+            "imu_configure": (ct.c_int, (ct.c_uint32, ct.c_double)),
+            "imu_mount": (ct.c_int, (ct.POINTER(ct.c_double), ct.POINTER(ct.c_double))),
+            "imu_observation": (None, (ct.POINTER(ct.c_double), ct.c_int, ct.c_uint64, ct.c_uint64)),
             "current": (None, (ct.c_uint8, ct.c_double, ct.c_int)),
             "fault": (None, (ct.c_uint8, ct.c_int)),
+            "sleep_readback_failure": (ct.c_int, (ct.c_uint8, ct.c_int)),
+            "wake_readback_failure": (ct.c_int, (ct.c_uint8, ct.c_int)),
+            "fram_load": (ct.c_int, (ct.c_void_p, ct.c_size_t)),
+            "fram_read": (ct.c_size_t, (ct.c_void_p, ct.c_size_t)),
+            "fram_fault": (None, (ct.c_int64, ct.c_int)),
+            "temperature_reads": (ct.c_uint64, ()), "imu_reads": (ct.c_uint64, ()),
+            "fram_reads": (ct.c_uint32, ()), "fram_writes": (ct.c_uint32, ()),
         }
+        self.has_drv8870 = hasattr(self._lib, "sim_pad")
+        if self.has_drv8870:
+            signatures.update({
+                "usb_busy": (None, (ct.c_int,)),
+                "timer_ticks": (ct.c_int, (ct.c_uint, ct.c_uint)),
+                "motor_pad_touched": (ct.c_int, (ct.c_uint, ct.c_uint)),
+                "pad_af": (ct.c_int, (ct.c_uint, ct.c_uint)),
+                "pad": (ct.c_int, (ct.c_uint, ct.c_uint, ct.POINTER(ct.c_int))),
+                "low_dwell_ms": (ct.c_uint64, ()),
+                "i2c_write": (ct.c_int, (ct.c_void_p, ct.c_size_t, ct.c_int)),
+                "i2c_begin_read": (None, ()),
+                "i2c_end_read": (ct.c_size_t, (ct.c_void_p, ct.c_size_t)),
+            })
         for name, (result, arguments) in signatures.items():
             function = getattr(self._lib, "sim_" + name)
             function.restype, function.argtypes = result, arguments
+        if fram_image is not None:
+            self._lib.sim_fram_load(fram_image, len(fram_image))
+        self._lib.sim_fram_fault(-1, bool(fram_read_failure))
+        if not self._lib.sim_imu_configure(imu_seed, temperature_c):
+            self.close()
+            raise ValueError("Unable to configure native IMU before startup")
         self._lib.sim_init()
+        self.imu_mount = None
+        if imu_mount is not None:
+            try:
+                self.set_imu_mount(imu_mount.offset_m, imu_mount.board_to_chassis)
+            except BaseException:
+                self.close()
+                raise
+
+    @property
+    def fram_image(self):
+        """Raw nonvolatile bytes; pass to a new board to simulate a cold boot.
+
+        A new board loads a separate library with fresh runtime globals. Do not
+        call sim_init again on the old instance: that is not a cold restart.
+        """
+        with self._lock:
+            self._check_open()
+            data = ct.create_string_buffer(self.FRAM_SIZE)
+            if self._lib.sim_fram_read(data, self.FRAM_SIZE) != self.FRAM_SIZE:
+                raise RuntimeError("Unable to read virtual FRAM image")
+            return data.raw
+
+    @property
+    def sensor_read_counts(self):
+        """Count calls into the virtual sensor hardware, including explicit reads."""
+        with self._lock:
+            self._check_open()
+            return {"temperature": self._lib.sim_temperature_reads(), "imu": self._lib.sim_imu_reads()}
+
+    @property
+    def fram_transactions(self):
+        with self._lock:
+            self._check_open()
+            return (self._lib.sim_fram_reads(), self._lib.sim_fram_writes())
+
+    def set_fram_fault(self, *, write_after_bytes=None, read_failure=False):
+        """Fail writes after a byte budget, retaining already-written bytes.
+
+        The budget spans transactions until reset. None disables write failure;
+        zero fails the next write before changing storage. Read failure never
+        mutates bytes. Faults are intentionally below the production journal.
+        """
+        if write_after_bytes is not None and (type(write_after_bytes) is not int or
+                                               not 0 <= write_after_bytes < 2**63):
+            raise ValueError("Write budget must be a nonnegative int64 or None")
+        with self._lock:
+            self._check_open()
+            self._lib.sim_fram_fault(-1 if write_after_bytes is None else write_after_bytes,
+                                    bool(read_failure))
 
     def _check_open(self):
         if not self._finalizer.alive:
@@ -104,10 +205,100 @@ class FirmwareBoard:
             return bool(self._lib.sim_lost())
 
     @property
+    def controller_dispatches(self):
+        """Number of scheduled controller task activations after its startup delay."""
+        with self._lock:
+            self._check_open()
+            return self._lib.sim_controller_dispatches()
+
+    @property
+    def encoder_counts(self):
+        """Raw 16-bit counter registers at the simulated encoder boundary."""
+        with self._lock:
+            self._check_open()
+            return tuple(self._lib.sim_encoder_count(i) for i in range(4))
+
+    @property
     def motor_pwm(self):
         with self._lock:
             self._check_open()
             return tuple(self._lib.sim_pwm(i) for i in range(4))
+
+    def _check_drv8870(self):
+        self._check_open()
+        if not self.has_drv8870:
+            raise ValueError("This observation requires a native DRV8870 sleep profile")
+
+    def input_pad(self, bank, bit):
+        """Return (source, high ticks per 840) for a motor input, or (None, None)."""
+        if bank not in ("A", "B", "C", "D", "E") or not isinstance(bit, int) or not 0 <= bit < 16:
+            raise ValueError("Expected GPIO bank A..E and bit 0..15")
+        with self._lock:
+            self._check_drv8870()
+            ticks = ct.c_int()
+            source = self._lib.sim_pad(ord(bank) - ord("A"), bit, ct.byref(ticks))
+            if source < 0:
+                return None, None
+            return ("timer" if source else "gpio"), ticks.value
+
+    def timer_ticks(self, timer, channel):
+        """Raw compare on a started regular channel, or -1 if it has not started."""
+        if timer not in range(1, 13) or channel not in range(1, 5):
+            raise ValueError("Expected TIM1..12, channel 1..4")
+        with self._lock:
+            self._check_drv8870()
+            return self._lib.sim_timer_ticks(timer, channel)
+
+    def motor_pad_touched(self, bank, bit):
+        """Whether motor firmware has ever configured or written this pad since boot."""
+        if bank not in ("A", "B", "C", "D", "E") or type(bit) is not int or not 0 <= bit <= 15:
+            raise ValueError("Expected GPIO bank A..E and bit 0..15")
+        with self._lock:
+            self._check_drv8870()
+            return bool(self._lib.sim_motor_pad_touched(ord(bank) - ord("A"), bit))
+
+    def pad_alternate_function(self, bank, bit):
+        """Alternate function selected by HAL_GPIO_Init, or -1 in GPIO mode."""
+        if bank not in ("A", "B", "C", "D", "E") or bit not in range(16):
+            raise ValueError("Expected GPIO bank A..E and bit 0..15")
+        with self._lock:
+            self._check_drv8870()
+            return self._lib.sim_pad_af(ord(bank) - ord("A"), bit)
+
+    @property
+    def low_dwell_ms(self):
+        """Total HAL delay requested while all eight pads were GPIO outputs reading low."""
+        with self._lock:
+            self._check_drv8870()
+            return self._lib.sim_low_dwell_ms()
+
+    def set_usb_busy(self, busy):
+        """Hold USB replies pending to model an occupied CDC transmit endpoint."""
+        with self._lock:
+            self._check_drv8870()
+            self._lib.sim_usb_busy(bool(busy))
+            self._poll()
+
+    def i2c_write(self, data, *, start=True):
+        """Start a master write, or continue the same transaction with start=False."""
+        data = bytes(data)
+        with self._lock:
+            self._check_drv8870()
+            if not self._lib.sim_i2c_write(data, len(data), start):
+                raise ValueError("I2C write exceeds the active length-prefixed transaction")
+            self._poll()
+
+    def i2c_read(self, size=256):
+        """One fixed-size master read. An empty result means no reply was ready."""
+        if type(size) is not int or not 1 <= size <= 256:
+            raise ValueError("I2C master read size must be 1..256")
+        with self._lock:
+            self._check_drv8870()
+            buffer = ct.create_string_buffer(size)
+            self._lib.sim_i2c_begin_read()
+            self._poll()
+            length = self._lib.sim_i2c_end_read(buffer, size)
+            return buffer.raw[:length]
 
     def feed(self, data):
         data = bytes(data)
@@ -155,6 +346,7 @@ class FirmwareBoard:
                 for encoder, motor in enumerate(self.encoder_motors):
                     self._counts[encoder] += delta[motor] * self._lib.sim_resolution(encoder) / math.tau
                     self._lib.sim_encoder(encoder, int(self._counts[encoder]) & 0xffff)
+                self._lib.sim_shaft_velocity((ct.c_double * 4)(*self.motor_velocity))
                 self.now_us += step
                 self._poll()
             self._poll()
@@ -166,17 +358,74 @@ class FirmwareBoard:
             self._check_open()
             self._lib.sim_drop(self.schema.code(command), count)
 
+    def set_encoder_sampling(self, index, enabled):
+        """Enable or disable the simulated quadrature timer, retaining its counter."""
+        self._index(index)
+        with self._lock:
+            self._check_open()
+            self._lib.sim_encoder_sampling(index, bool(enabled))
+
     def set_temperature(self, celsius=25., *, status=0):
         with self._lock:
             self._check_open()
             self._lib.sim_temperature(celsius, status)
 
-    def set_imu(self, acceleration=(0., 0., 9.80665), angular_velocity=(0., 0., 0.), *, status=0):
-        if len(acceleration) != 3 or len(angular_velocity) != 3:
-            raise ValueError("IMU vectors must have three components")
+    def set_imu_mount(
+        self,
+        offset_m=(0., 0., 0.),
+        board_to_chassis=((1., 0., 0.), (0., 1., 0.), (0., 0., 1.)),
+    ):
+        """Set physical model geometry at clock zero, before exact injection.
+
+        Offset is metres from the chassis origin to the chip in forward/left/up
+        axes. The nested 3x3 proper rotation maps board axes into chassis axes.
+        This changes generated physical readings, never estimator configuration.
+        Exact set_imu values are already chip axes and bypass this model entirely.
+        """
+        try:
+            offset = tuple(float(x) for x in offset_m)
+            matrix = tuple(tuple(float(x) for x in row) for row in board_to_chassis)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("IMU mount requires a 3-vector and nested 3x3 rotation") from exc
+        if (len(offset) != 3 or len(matrix) != 3
+                or any(len(row) != 3 for row in matrix)):
+            raise ValueError("IMU mount requires a 3-vector and nested 3x3 rotation")
+        values = tuple(x for row in matrix for x in row)
+        if not all(math.isfinite(x) for x in (*offset, *values)):
+            raise ValueError("IMU mount must be finite")
+        mount = Mount(offset, matrix)
         with self._lock:
             self._check_open()
-            self._lib.sim_imu((ct.c_double * 6)(*acceleration, *angular_velocity), status)
+            if self.revision != (0, 4, 0):
+                raise ValueError("Physical IMU mount requires a board with an IMU")
+            accepted = self._lib.sim_imu_mount(
+                (ct.c_double * 3)(*offset), (ct.c_double * 9)(*values)
+            )
+            if not accepted:
+                raise ValueError(
+                    "IMU mount requires clock zero, model ownership and a proper rigid rotation"
+                )
+            self.imu_mount = mount
+
+    def set_imu(self, acceleration=(0., 0., 9.80665), angular_velocity=(0., 0., 0.), *,
+                status=0, accel_us=None, gyro_us=None):
+        """Switch from the BMI088 model to exact, latched observation injection.
+
+        Values are native chip axes, bypassing any physical mount transform.
+        Values, status and acquisition times remain fixed until the next call.
+        Omitted acquisition times use the current board clock. The external
+        chassis uses this path to deliver its independently sampled IMU model.
+        """
+        if len(acceleration) != 3 or len(angular_velocity) != 3:
+            raise ValueError("IMU vectors must have three components")
+        for stamp in (accel_us, gyro_us):
+            if stamp is not None and (type(stamp) is not int or not 0 <= stamp < 2**64):
+                raise ValueError("IMU acquisition times must be unsigned 64-bit microseconds")
+        with self._lock:
+            self._check_open()
+            self._lib.sim_imu_observation((ct.c_double * 6)(*acceleration, *angular_velocity), status,
+                                          self.now_us if accel_us is None else accel_us,
+                                          self.now_us if gyro_us is None else gyro_us)
 
     def set_current(self, index, amperes=0., *, status=0):
         self._index(index)
@@ -194,6 +443,22 @@ class FirmwareBoard:
         with self._lock:
             self._check_open()
             self._lib.sim_fault(index, active)
+
+    def set_sleep_readback_failure(self, index, active=True):
+        """Force nSLEEP (DRV8873) or IN1 (DRV8870) readback high until cleared."""
+        self._index(index)
+        with self._lock:
+            self._check_open()
+            if not self._lib.sim_sleep_readback_failure(index, active):
+                raise ValueError("Selected firmware has no simulated driver sleep pins")
+
+    def set_wake_readback_failure(self, index, active=True):
+        """Corrupt the channel's IC4 readback after writes until cleared."""
+        self._index(index)
+        with self._lock:
+            self._check_open()
+            if not self._lib.sim_wake_readback_failure(index, active):
+                raise ValueError("Selected firmware has no simulated driver SPI interface")
 
     def disconnect(self):
         with self._lock:

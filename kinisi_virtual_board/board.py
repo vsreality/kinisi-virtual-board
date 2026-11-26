@@ -8,6 +8,7 @@ import json
 import math
 from pathlib import Path
 
+from .bmi088 import BMI088
 from .schema import Rejected, Schema
 
 MOTOR_COMMANDS = set("""INITIALIZE_MOTOR SET_MOTOR_SPEED STOP_MOTOR BRAKE_MOTOR
@@ -64,7 +65,8 @@ class Encoder:
 
 
 class VirtualBoard:
-    def __init__(self, commands, board_profile=None, *, revision="0.4.0", pwm_speed=10.0):
+    def __init__(self, commands, board_profile=None, *, revision="0.4.0", pwm_speed=10.0, imu_seed=1,
+                 temperature_c=25.0, imu_mount=None):
         self.schema = commands if isinstance(commands, Schema) else Schema(commands)
         self.profile = json.loads(Path(board_profile).read_text()) if board_profile else None
         if self.profile:
@@ -94,6 +96,13 @@ class VirtualBoard:
         self.platform_target = None
         self.temperature = 25.0
         self.imu = dict(zip((p["name"] for p in self.schema.objects["imu_sample"]), (0., 0., 9.80665, 0., 0., 0.)))
+        has_imu = self.revision == (0, 4, 0) and self.sensor_counts["imu"]
+        if imu_mount is not None and not has_imu:
+            raise ValueError("A physical IMU mount requires a board with a BMI088")
+        self.imu_model = BMI088(imu_seed, temperature_c=temperature_c, mount=imu_mount) if has_imu else None
+        self._imu_generated = dict(self.imu)
+        self._imu_override = False
+        self._imu_velocity = (0., 0., 0.)
         self.sensor_errors = {}
         self.now_us = 0
         self.initialized = self.ready = self.lost = False
@@ -118,6 +127,15 @@ class VirtualBoard:
         return sorted(c["command"] for c in self.schema.commands.values()
                       if c["direction"] == "client_to_controller" and c["command"] not in SUPPORTED)
 
+    @property
+    def imu(self):
+        return self._imu
+
+    @imu.setter
+    def imu(self, values):
+        self._imu = values
+        self._imu_override = True
+
     def drop_next_reply(self, command, count=1):
         """Execute requests normally but lose their next correlated responses."""
         self._drop[command] = count
@@ -127,6 +145,36 @@ class VirtualBoard:
         if error not in self.schema.errors:
             raise ValueError(error)
         self._errors[command] = error
+
+    def set_imu(self, acceleration=(0., 0., 9.80665), angular_velocity=(0., 0., 0.)):
+        """Override sensor output in native axes and SI units for protocol tests.
+
+        Direct changes to the historical public ``imu`` dictionary also latch an
+        override at the next advance, retaining existing fixture behavior.
+        """
+        acceleration, angular_velocity = tuple(acceleration), tuple(angular_velocity)
+        values = acceleration + angular_velocity
+        if len(acceleration) != 3 or len(angular_velocity) != 3 or not all(math.isfinite(v) for v in values):
+            raise ValueError("IMU acceleration and angular velocity need three finite values each")
+        self.imu = dict(zip(self.imu, values))
+        self._imu_override = True
+
+    def _advance_imu(self, at_us, dt):
+        if self.imu_model is None:
+            return
+        if self.imu != self._imu_generated:
+            self._imu_override = True
+        if self._imu_override:
+            return
+        vx, vy, omega = self.velocity
+        old_vx, old_vy, _ = self._imu_velocity
+        # Planar chassis motion only: body velocity derivative plus rotation.
+        # This behavioral model has no suspension, tilt, vibration, or wheel slip.
+        accel = ((vx-old_vx)/dt - omega*vy, (vy-old_vy)/dt + omega*vx, 9.80665)
+        self.imu_model.advance(at_us, body_accel=accel, body_gyro=(0., 0., omega))
+        self.imu.update(zip(self.imu, self.imu_model.values))
+        self._imu_generated = dict(self.imu)
+        self._imu_velocity = tuple(self.velocity)
 
     def drain(self, size=None):
         size = len(self._output) if size is None else size
@@ -689,9 +737,15 @@ class VirtualBoard:
             step = min(10000, motion_end - self.now_us)
             self._integrate(step / 1000000)
             self.now_us += step
+            self._advance_imu(self.now_us, step / 1000000)
         if self.heartbeat_enabled and target >= expiry:
             self.disconnect()
-        self.now_us = target
+        # Keep sensor input cadence after watchdog stop. A single long remainder
+        # would spread the stopping impulse over that entire interval.
+        while self.now_us < target:
+            step = min(10000, target - self.now_us)
+            self.now_us += step
+            self._advance_imu(self.now_us, step / 1000000)
         if self.ready and self.clock_mode and not self.sync_pending and self.now_us - self.last_sync_us >= self.sync_interval_ms * 1000:
             self._request_sync()
         if self.ready:

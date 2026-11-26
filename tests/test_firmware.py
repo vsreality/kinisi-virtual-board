@@ -74,7 +74,10 @@ class FirmwareTests(unittest.TestCase):
         self.assertEqual(self.board.motor_pwm[0], 0)
         self.board.advance(.001)
         # Actual first C PID iteration: P=10*2, I=20*.01*2, D=0.
-        self.assertAlmostEqual(self.board.motor_pwm[0], 20.4)
+        expected = 20.4
+        if "lib/hardware/hw_motor.c" in self.board.build["sources"]:
+            expected = int(expected * 840 / 100) * 100 / 840
+        self.assertAlmostEqual(self.board.motor_pwm[0], expected)
         self.assertEqual(self.board.motor_velocity[0], 0)
         self.board.advance(4)
         self.assertAlmostEqual(self.board.motor_velocity[0], 2, delta=.04)
@@ -160,10 +163,12 @@ class FirmwareTests(unittest.TestCase):
 
     def test_driver_initialization_failure_reaches_command_handler(self):
         self.initialize()
-        self.board.set_fault(0)
+        fail = (self.board.set_wake_readback_failure if "lib/hardware/hw_motor.c" in self.board.build["sources"]
+                else self.board.set_fault)
+        fail(0)
         self.error("INITIALIZE_MOTOR", "INTERNAL_ERROR")
         self.assertEqual(self.board.motor_pwm[0], 0)
-        self.board.set_fault(0, False)
+        fail(0, False)
         self.ok("INITIALIZE_MOTOR")
         self.ok("SET_MOTOR_SPEED", pwm=25)
         self.assertEqual(self.board.motor_pwm[0], 25)

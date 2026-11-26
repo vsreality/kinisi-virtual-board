@@ -14,6 +14,7 @@ from unittest.mock import patch
 from kinisi_virtual_board import VirtualBoard, FirmwareBoard
 from kinisi_virtual_board.native import PTYEndpoint, SerialEndpoint, serve_native
 from test_board import COMMANDS, frames
+from test_firmware import FIRMWARE
 
 
 class NativeLoopTests(unittest.TestCase):
@@ -132,7 +133,7 @@ class NativeSDKMixin:
             client.disconnect()
 
     def run_endpoint(self, endpoint, client_port):
-        board = FirmwareBoard(COMMANDS)
+        board = FirmwareBoard(COMMANDS, firmware=FIRMWARE)
         self.addCleanup(board.close)
         stop = threading.Event()
         failures = []
@@ -177,7 +178,8 @@ class LinuxPTYTests(NativeSDKMixin, unittest.TestCase):
                 self.assertEqual(os.read(peer.master, 4096), request)
 
     def test_cli_creates_native_port_without_socket(self):
-        process = subprocess.Popen([sys.executable, "-m", "kinisi_virtual_board", "--pty", "--commands", str(COMMANDS)],
+        process = subprocess.Popen([sys.executable, "-m", "kinisi_virtual_board", "--pty",
+                                    "--commands", str(COMMANDS), "--firmware", str(FIRMWARE)],
                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         try:
             self.assertTrue(select.select([process.stdout], [], [], 30)[0], "CLI build/startup timed out")

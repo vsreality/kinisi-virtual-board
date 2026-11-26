@@ -43,6 +43,7 @@ public:
                 firmware_.encoder(e, static_cast<uint16_t>(static_cast<int32_t>(counts_[e])));
             }
             now += step;
+            firmware_.shaft_velocity(velocity.data());
             poll();
         }
         poll();
